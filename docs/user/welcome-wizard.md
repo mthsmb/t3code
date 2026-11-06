@@ -76,7 +76,8 @@ projects it found and warns when projects or conversations may be missing.
 
 Imported projects include Claude, Codex and Pi conversations active within the last
 30 days. You can continue those conversations in T3 Code. Pi is off by default:
-enable it in Settings, then open `/welcome` to import its sessions. Pi sessions
+enable it in Settings, then import its sessions from Settings → Threads →
+Session import. Pi sessions
 are read from each enabled Pi provider's session directory, which follows
 `PI_CODING_AGENT_SESSION_DIR` and `PI_CODING_AGENT_DIR` in its environment. A
 Pi conversation imports its active branch, the one Pi reopens.
@@ -96,6 +97,11 @@ Each import attempt reads up to 100 conversation files and 4 GiB per project,
 with up to 100,000 input records. Run import again to continue a large batch.
 Completed conversations are not imported again. You can continue without the
 remaining history.
+
+To import after setup, such as conversations you started in a terminal later,
+use Import… in Settings → Threads → Session import. It shows the same project
+list for your connected computers, including projects you already added, and
+skips conversations that were already imported.
 
 You can continue without configuring agents or importing projects, or return to an earlier step
 using the setup progress bar. Navigation pauses while an import is running.

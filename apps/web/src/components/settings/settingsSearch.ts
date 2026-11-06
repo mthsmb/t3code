@@ -770,6 +770,16 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["ghq clone destination host owner repository root layout"],
   },
   {
+    id: "import-agent-sessions",
+    title: "Import from Claude Code, Codex, and Pi",
+    to: "/settings/threads",
+    scope: "environment-defaults",
+    environmentOnly: true,
+    searchTerms: [
+      "import projects conversations sessions history threads onboarding claude codex pi",
+    ],
+  },
+  {
     id: "unpin-confirmation",
     title: "Unpin confirmation",
     to: "/settings/general",
