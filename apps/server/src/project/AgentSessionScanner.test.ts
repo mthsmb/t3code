@@ -5,6 +5,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodeSqlite from "node:sqlite";
+import * as NodeURL from "node:url";
 import { describe, expect, it } from "@effect/vitest";
 import {
   AgentSessionImportSource,
@@ -33,6 +34,15 @@ import * as ProcessRunner from "../processRunner.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
+import {
+  appendSteps,
+  openConversationWriter,
+  plannerStep,
+  seedConversation,
+  toolStep,
+  trajectoryMetadata,
+  userStep,
+} from "./AntigravityConversations.testkit.ts";
 
 const makeProjectShell = (workspaceRoot: string): OrchestrationProjectShell => ({
   id: ProjectId.make("project-1"),
@@ -181,6 +191,141 @@ function makeRecordLimitTranscript(cwd: string, overflow: boolean): string {
         "\n"
     : records;
 }
+
+const HOUR_MS = 60 * 60 * 1000;
+
+const ANTIGRAVITY_IDS = {
+  cli: "0a7e0c1e-5b1a-4c3d-9e2f-000000000001",
+  live: "0a7e0c1e-5b1a-4c3d-9e2f-000000000002",
+  rest: "0a7e0c1e-5b1a-4c3d-9e2f-000000000003",
+  subagent: "0a7e0c1e-5b1a-4c3d-9e2f-000000000004",
+  nested: "0a7e0c1e-5b1a-4c3d-9e2f-000000000005",
+  noWorkspace: "0a7e0c1e-5b1a-4c3d-9e2f-000000000006",
+  acp: "0a7e0c1e-5b1a-4c3d-9e2f-000000000007",
+  empty: "0a7e0c1e-5b1a-4c3d-9e2f-000000000008",
+  legacy: "0a7e0c1e-5b1a-4c3d-9e2f-000000000009",
+} as const;
+
+/**
+ * Antigravity data in two configured roots: one with a `conversations` directory, and one that is
+ * itself the conversations directory of an ACP client. A WAL writer stays open for the test scope.
+ */
+const makeAntigravityFixture = Effect.fn("AgentSessionScanner.test.makeAntigravityFixture")(
+  function* (nowMs: number) {
+    const path = yield* Path.Path;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const dataRoot = yield* makeTempDir("t3code-antigravity-data-");
+    const acpConversations = yield* makeTempDir("t3code-antigravity-acp-");
+    const workspace = yield* makeTempDir("t3code-workspace-");
+    const acpWorkspace = yield* makeTempDir("t3code-workspace-acp-");
+    const conversations = path.join(dataRoot, "conversations");
+    yield* fileSystem.makeDirectory(conversations);
+    const touch = (filePath: string, mtimeMs: number) =>
+      fileSystem.utimes(filePath, mtimeMs / 1000, mtimeMs / 1000);
+    const seed = Effect.fn("AgentSessionScanner.test.seedAntigravity")(function* (
+      directory: string,
+      id: string,
+      mtimeMs: number,
+      input: Parameters<typeof seedConversation>[1],
+    ) {
+      const filePath = path.join(directory, `${id}.db`);
+      yield* seedConversation(filePath, input);
+      yield* touch(filePath, mtimeMs);
+      return filePath;
+    });
+    const createdAtMs = Date.parse("2026-08-23T09:00:00.000Z");
+    const at = (minute: number) => createdAtMs + minute * 60 * 1000;
+    const workspaceUris = [
+      NodeURL.pathToFileURL(workspace).href,
+      NodeURL.pathToFileURL(path.join(dataRoot, "skills")).href,
+    ];
+
+    yield* seed(conversations, ANTIGRAVITY_IDS.cli, nowMs - 3 * HOUR_MS, {
+      trajectory: trajectoryMetadata({ createdAtMs, workspaceUris }),
+      steps: [
+        userStep(at(60), { text: "Add a retry\nwith backoff" }),
+        toolStep(at(61)),
+        toolStep(at(62), { denied: true }),
+        plannerStep(at(63), { thinking: "Read the client", toolCalls: ["view_file"] }),
+        plannerStep(at(65), { reply: "Added" }),
+      ],
+    });
+    const live = yield* seed(conversations, ANTIGRAVITY_IDS.live, nowMs - 48 * HOUR_MS, {
+      journalMode: "wal",
+      trajectory: trajectoryMetadata({ createdAtMs, workspaceUris }),
+      steps: [
+        userStep(at(10), { text: "Rename the module" }),
+        plannerStep(at(11), { reply: "Renamed" }),
+      ],
+    });
+    const writer = yield* openConversationWriter(live);
+    yield* writer.unsafe("PRAGMA wal_autocheckpoint = 0");
+    yield* appendSteps(writer, 2, [plannerStep(at(12), { reply: "Also updated the imports" })]);
+    yield* touch(live, nowMs - 48 * HOUR_MS);
+    yield* touch(`${live}-wal`, nowMs - 2 * HOUR_MS);
+    const rest = yield* seed(conversations, ANTIGRAVITY_IDS.rest, nowMs - 6 * HOUR_MS, {
+      journalMode: "wal",
+      trajectory: trajectoryMetadata({ createdAtMs, workspaceUris }),
+      steps: [
+        userStep(at(20), { text: "Explain the cache" }),
+        plannerStep(at(21), { reply: "It memoizes" }),
+      ],
+    });
+    yield* fileSystem.writeFileString(`${rest}-wal`, "");
+    yield* touch(`${rest}-wal`, nowMs - HOUR_MS);
+    yield* seed(conversations, ANTIGRAVITY_IDS.subagent, nowMs, {
+      trajectory: trajectoryMetadata({
+        createdAtMs,
+        workspaceUris,
+        parentConversationId: ANTIGRAVITY_IDS.cli,
+      }),
+      steps: [userStep(at(64), { text: "Run the subtask" })],
+    });
+    yield* seed(conversations, ANTIGRAVITY_IDS.nested, nowMs, {
+      trajectory: trajectoryMetadata({ createdAtMs, workspaceUris, nestingDepth: 1 }),
+      steps: [userStep(at(64), { text: "Run the nested task" })],
+    });
+    yield* seed(conversations, ANTIGRAVITY_IDS.noWorkspace, nowMs - HOUR_MS, {
+      trajectory: trajectoryMetadata({ createdAtMs }),
+      steps: [userStep(at(30), { text: "Summarize monads" })],
+    });
+    yield* fileSystem.writeFileString(path.join(conversations, `${ANTIGRAVITY_IDS.empty}.db`), "");
+    yield* fileSystem.writeFileString(
+      path.join(conversations, `${ANTIGRAVITY_IDS.legacy}.pb`),
+      "encrypted",
+    );
+    yield* seed(acpConversations, ANTIGRAVITY_IDS.acp, nowMs - 4 * HOUR_MS, {
+      journalMode: "wal",
+      trajectory: trajectoryMetadata({ createdAtMs }),
+      steps: [
+        userStep(at(40), { text: "Explain this file" }),
+        plannerStep(at(41), { reply: "Sure" }),
+      ],
+    });
+    yield* fileSystem.writeFileString(
+      path.join(acpConversations, `${ANTIGRAVITY_IDS.acp}.meta`),
+      JSON.stringify({ cwd: acpWorkspace }),
+    );
+
+    return {
+      workspace,
+      acpWorkspace,
+      at,
+      instance: {
+        driver: ProviderDriverKind.make("antigravity"),
+        enabled: true,
+        environment: [
+          {
+            name: "ANTIGRAVITY_DATA_DIR",
+            value: `${dataRoot}, ${acpConversations}`,
+            sensitive: false,
+          },
+        ],
+        config: {},
+      },
+    };
+  },
+);
 
 const makeFileIdentityFixture = Effect.fn("AgentSessionScanner.test.makeFileIdentityFixture")(
   function* (originalInode = 10_000_000_000_000_001n, replacementInode = 10_000_000_000_000_000n) {
@@ -716,15 +861,30 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
-    it.effect("does not scan provider instances disabled by the envelope or config", () =>
+    it.effect("does not scan provider instances disabled by the envelope, config, or default", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
         const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
         const codexHomePath = yield* makeTempDir("t3code-codex-home-");
         const envelopeDisabledHome = yield* makeTempDir("t3code-codex-disabled-envelope-");
         const configDisabledHome = yield* makeTempDir("t3code-codex-disabled-config-");
         const envelopeWorkspace = yield* makeTempDir("t3code-workspace-disabled-envelope-");
         const configWorkspace = yield* makeTempDir("t3code-workspace-disabled-config-");
+        const antigravityRoot = yield* makeTempDir("t3code-antigravity-default-off-");
+        const antigravityWorkspace = yield* makeTempDir("t3code-workspace-default-off-");
+        const antigravityAt = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* fileSystem.makeDirectory(path.join(antigravityRoot, "conversations"));
+        yield* seedConversation(
+          path.join(antigravityRoot, "conversations", `${ANTIGRAVITY_IDS.cli}.db`),
+          {
+            trajectory: trajectoryMetadata({
+              createdAtMs: antigravityAt,
+              workspaceUris: [NodeURL.pathToFileURL(antigravityWorkspace).href],
+            }),
+            steps: [userStep(antigravityAt, { text: "Fix the build" })],
+          },
+        );
 
         for (const [home, workspace, session] of [
           [envelopeDisabledHome, envelopeWorkspace, "envelope-disabled"],
@@ -750,11 +910,58 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
               driver: ProviderDriverKind.make("codex"),
               config: { enabled: false, homePath: configDisabledHome },
             },
+            [ProviderInstanceId.make("antigravity")]: {
+              driver: ProviderDriverKind.make("antigravity"),
+              environment: [
+                { name: "ANTIGRAVITY_DATA_DIR", value: antigravityRoot, sensitive: false },
+              ],
+              config: {},
+            },
           },
         });
 
         expect(result.candidates).toEqual([]);
       }),
+    );
+
+    it.effect(
+      "groups Antigravity conversations by workspace, without subagents or workspace-less ones",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+          const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+          const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+          const { workspace, acpWorkspace, instance } = yield* makeAntigravityFixture(nowMs);
+
+          const result = yield* runScan({
+            claudeHomePath,
+            codexHomePath,
+            providerInstances: { [ProviderInstanceId.make("antigravity")]: instance },
+          });
+
+          expect(result.truncated).toBeUndefined();
+          expect(result.candidates).toEqual([
+            {
+              path: workspace,
+              title: path.basename(workspace),
+              sources: ["antigravity"],
+              threadCount: 3,
+              lastActiveAt: DateTime.formatIso(DateTime.makeUnsafe(nowMs - 2 * HOUR_MS)),
+              alreadyImported: false,
+              git: null,
+            },
+            {
+              path: acpWorkspace,
+              title: path.basename(acpWorkspace),
+              sources: ["antigravity"],
+              threadCount: 1,
+              lastActiveAt: DateTime.formatIso(DateTime.makeUnsafe(nowMs - 4 * HOUR_MS)),
+              alreadyImported: false,
+              git: null,
+            },
+          ]);
+        }),
     );
 
     it.effect("drops candidates whose directory no longer exists", () =>
@@ -1285,6 +1492,65 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         ]);
         expect(threads[0]).toMatchObject({ source: "pi", title: "Pi refactor" });
       }),
+    );
+
+    it.effect(
+      "imports Antigravity conversations started outside T3 Code, including WAL steps",
+      () =>
+        Effect.gen(function* () {
+          const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+          yield* TestClock.setTime(nowMs);
+          const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+          const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+          const { workspace, acpWorkspace, at, instance } = yield* makeAntigravityFixture(nowMs);
+          const run = (workspaceRoot: string) =>
+            runRecentThreads({
+              claudeHomePath,
+              codexHomePath,
+              workspaceRoot,
+              providerInstances: { [ProviderInstanceId.make("antigravity")]: instance },
+            });
+          const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
+          const thread = (
+            providerSessionId: string,
+            title: string,
+            updatedAtMs: number,
+            messages: ReadonlyArray<readonly ["user" | "assistant", string, number]>,
+          ) => ({
+            source: "antigravity",
+            providerInstanceId: "antigravity",
+            providerSessionId,
+            title,
+            model: null,
+            createdAt: iso(messages[0]![2]),
+            updatedAt: iso(updatedAtMs),
+            messages: messages.map(([role, text, createdAtMs]) => ({
+              role,
+              text,
+              createdAt: iso(createdAtMs),
+            })),
+            omittedMessageCount: 0,
+          });
+
+          expect(yield* run(workspace)).toEqual([
+            thread(ANTIGRAVITY_IDS.live, "Rename the module", nowMs - 2 * HOUR_MS, [
+              ["user", "Rename the module", at(10)],
+              ["assistant", "Renamed", at(11)],
+              ["assistant", "Also updated the imports", at(12)],
+            ]),
+            thread(ANTIGRAVITY_IDS.cli, "Add a retry", nowMs - 3 * HOUR_MS, [
+              ["user", "Add a retry\nwith backoff", at(60)],
+              ["assistant", "Added", at(65)],
+            ]),
+            thread(ANTIGRAVITY_IDS.rest, "Explain the cache", nowMs - 6 * HOUR_MS, [
+              ["user", "Explain the cache", at(20)],
+              ["assistant", "It memoizes", at(21)],
+            ]),
+          ]);
+          expect((yield* run(acpWorkspace)).map((imported) => imported.title)).toEqual([
+            "Explain this file",
+          ]);
+        }),
     );
 
     it.effect("keeps the provider instance that owns a custom session home", () =>
@@ -2445,9 +2711,9 @@ describe("parseAgentSessionTranscript", () => {
   );
 
   it.each([199, 200, 201, 205])(
-    "counts only omitted conversation messages for a %s-message Claude transcript",
+    "counts only omitted conversation messages for a %s-message Claude or Antigravity history",
     (count) => {
-      const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      const claude = AgentSessionScanner.parseAgentSessionTranscript({
         contents: [
           ...Array.from({ length: count }, (_, index) =>
             encodeTranscriptRecord({
@@ -2478,11 +2744,33 @@ describe("parseAgentSessionTranscript", () => {
         fallbackSessionId: "fallback",
         lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
       });
+      const antigravity = AgentSessionScanner.parseAntigravityTranscript(
+        {
+          source: "antigravity",
+          providerInstanceId: ProviderInstanceId.make("antigravity"),
+          fallbackSessionId: ANTIGRAVITY_IDS.cli,
+          lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+        },
+        {
+          createdAtMs: null,
+          messages: Array.from({ length: count }, (_, index) => ({
+            role: index === 0 ? ("user" as const) : ("assistant" as const),
+            text: `Message ${index}`,
+            createdAtMs: null,
+          })),
+          omittedMessageCount: 2,
+        },
+      );
 
-      expect(thread?.omittedMessageCount).toBe(Math.max(0, count - 200));
-      expect(thread?.messages).toHaveLength(Math.min(200, count));
-      expect(thread?.messages[0]?.text).toBe("Message 0");
-      expect(thread?.messages.at(-1)?.text).toBe(`Message ${count - 1}`);
+      for (const [thread, unreadMessages] of [
+        [claude, 0],
+        [antigravity, 2],
+      ] as const) {
+        expect(thread?.omittedMessageCount).toBe(Math.max(0, count - 200) + unreadMessages);
+        expect(thread?.messages).toHaveLength(Math.min(200, count));
+        expect(thread?.messages[0]?.text).toBe("Message 0");
+        expect(thread?.messages.at(-1)?.text).toBe(`Message ${count - 1}`);
+      }
     },
   );
 
