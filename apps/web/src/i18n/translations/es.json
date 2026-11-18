@@ -7308,7 +7308,7 @@
   "f2055b24025ebb9c": "Máximo de conversaciones importadas por proyecto cada vez que importas.",
   "369e5cba94c23990": "conversaciones",
   "5a232a306a158b5a": "Registros por conversación",
-  "97f1416cdb92afd1": "Líneas leídas de una conversación de Codex o Pi, incluida la actividad de herramientas. Las más largas se omiten.",
+  "9f4bc7eb92cec7ad": "Registros que se conservan de una conversación de Codex o Pi. Las más largas se omiten.",
   "939730b891ad1006": "registros",
   "38d6207b9e5877b8": "Presupuesto de escaneo",
   "aca67f69062ba3fa": "Datos del historial leídos de cada agente para saber dónde se ejecutaron las conversaciones. Auméntalo si faltan proyectos.",

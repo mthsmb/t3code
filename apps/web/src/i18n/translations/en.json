@@ -7315,7 +7315,7 @@
   "f2055b24025ebb9c": "Most conversations imported per project each time you import.",
   "369e5cba94c23990": "conversations",
   "5a232a306a158b5a": "Records per conversation",
-  "97f1416cdb92afd1": "Lines read from one Codex or Pi conversation, including tool activity. Longer ones are skipped.",
+  "9f4bc7eb92cec7ad": "Records kept from one Codex or Pi conversation. Longer ones are skipped.",
   "939730b891ad1006": "records",
   "38d6207b9e5877b8": "Scan budget",
   "aca67f69062ba3fa": "History data read from each agent to find where conversations ran. Raise it when projects are missing.",

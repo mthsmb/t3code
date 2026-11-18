@@ -7307,7 +7307,7 @@
   "f2055b24025ebb9c": "Höchstzahl der Unterhaltungen, die bei jedem Import pro Projekt importiert werden.",
   "369e5cba94c23990": "Unterhaltungen",
   "5a232a306a158b5a": "Einträge pro Unterhaltung",
-  "97f1416cdb92afd1": "Zeilen, die aus einer Codex- oder Pi-Unterhaltung gelesen werden, einschließlich Toolaktivität. Längere werden übersprungen.",
+  "9f4bc7eb92cec7ad": "Einträge, die aus einer Codex- oder Pi-Unterhaltung übernommen werden. Längere werden übersprungen.",
   "939730b891ad1006": "Einträge",
   "38d6207b9e5877b8": "Scan-Budget",
   "aca67f69062ba3fa": "Verlaufsdaten, die von jedem Agenten gelesen werden, um herauszufinden, wo Unterhaltungen liefen. Erhöhe es, wenn Projekte fehlen.",

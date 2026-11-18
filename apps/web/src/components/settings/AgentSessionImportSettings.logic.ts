@@ -49,9 +49,7 @@ export const IMPORT_LIMITS: ReadonlyArray<ImportLimit> = [
     key: "recordsPerConversation",
     searchId: "agent-session-import-records",
     title: msg("Records per conversation"),
-    description: msg(
-      "Lines read from one Codex or Pi conversation, including tool activity. Longer ones are skipped.",
-    ),
+    description: msg("Records kept from one Codex or Pi conversation. Longer ones are skipped."),
     unit: msg("records", { $context: "import records per conversation unit" }),
     step: 1000,
   },

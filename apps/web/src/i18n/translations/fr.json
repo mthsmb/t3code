@@ -7309,7 +7309,7 @@
   "f2055b24025ebb9c": "Nombre maximal de conversations importées par projet à chaque importation.",
   "369e5cba94c23990": "conversations",
   "5a232a306a158b5a": "Enregistrements par conversation",
-  "97f1416cdb92afd1": "Lignes lues dans une conversation Codex ou Pi, activité des outils comprise. Les plus longues sont ignorées.",
+  "9f4bc7eb92cec7ad": "Enregistrements conservés d'une conversation Codex ou Pi. Les plus longues sont ignorées.",
   "939730b891ad1006": "enregistrements",
   "38d6207b9e5877b8": "Budget d’analyse",
   "aca67f69062ba3fa": "Données d’historique lues pour chaque agent afin de savoir où les conversations ont eu lieu. Augmentez-le s’il manque des projets.",

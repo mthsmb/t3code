@@ -7314,7 +7314,7 @@
   "f2055b24025ebb9c": "Högsta antal konversationer som importeras per projekt varje gång du importerar.",
   "369e5cba94c23990": "konversationer",
   "5a232a306a158b5a": "Poster per konversation",
-  "97f1416cdb92afd1": "Rader som läses från en Codex- eller Pi-konversation, inklusive verktygsaktivitet. Längre konversationer hoppas över.",
+  "9f4bc7eb92cec7ad": "Poster som behålls från en Codex- eller Pi-konversation. Längre konversationer hoppas över.",
   "939730b891ad1006": "poster",
   "38d6207b9e5877b8": "Skanningsbudget",
   "aca67f69062ba3fa": "Historikdata som läses från varje agent för att hitta var konversationerna kördes. Höj den när projekt saknas.",
