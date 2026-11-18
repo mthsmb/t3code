@@ -934,9 +934,14 @@ function ProjectsSection({
   if (candidates.length === 0) {
     return scan.data?.truncated ? (
       <WelcomeSection title={gt("Projects")}>
-        <p className="text-xs leading-10 text-muted-foreground" role="status">
-          {m(SCAN_LIMIT_MESSAGE)}
-        </p>
+        <div className="flex min-h-10 items-center justify-between gap-3">
+          <p className="text-xs text-muted-foreground" role="status">
+            {m(SCAN_LIMIT_MESSAGE)}
+          </p>
+          {canWrite && importOptions.supported ? (
+            <WelcomeImportOptions options={importOptions} />
+          ) : null}
+        </div>
       </WelcomeSection>
     ) : null;
   }

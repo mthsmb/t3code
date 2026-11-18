@@ -60,6 +60,7 @@ const state = vi.hoisted(() => ({
   scanPending: false,
   scanRefreshing: null as unknown,
   olderProjectCount: undefined as number | undefined,
+  scanTruncated: false,
   runningTerminalIds: null as unknown,
   openTerminal: vi.fn(),
   writeTerminal: vi.fn(),
@@ -165,7 +166,7 @@ vi.mock(import("../../onboarding/useProjectScans"), async (original) => {
         state.scan({ environmentId });
         const data = {
           candidates,
-          truncated: false,
+          truncated: state.scanTruncated,
           ...(state.olderProjectCount === undefined
             ? {}
             : { olderProjectCount: state.olderProjectCount }),
@@ -447,6 +448,7 @@ function setup() {
   state.scanPending = false;
   state.scanRefreshing = Atom.make(false).pipe(Atom.keepAlive);
   state.olderProjectCount = undefined;
+  state.scanTruncated = false;
   state.runningTerminalIds = Atom.make<ReadonlyArray<string>>([]).pipe(Atom.keepAlive);
   for (const command of [state.openTerminal, state.writeTerminal, state.closeTerminal]) {
     command.mockReset().mockResolvedValue(AsyncResult.success(undefined));
@@ -1102,6 +1104,22 @@ it("offers the time window when every project found has only older conversations
       .map((project) => project.workspaceRoot)
       .toSorted(),
   ).toEqual(["/projects/first", "/projects/second"]);
+});
+
+it("offers the time window when a truncated scan finds no project", async () => {
+  using _now = setup();
+  grantSettingsWrite();
+  appAtomRegistry.set(configAtom(), serverConfig());
+  appAtomRegistry.set(candidatesAtom(), []);
+  state.scanTruncated = true;
+  await using _screen = await mountWelcome();
+
+  await vi.waitFor(() =>
+    expect(pageText()).toContain(
+      "Scan limit reached. Some projects or conversations may be missing.",
+    ),
+  );
+  expect(pageText()).toContain("Last 30 days");
 });
 
 it("keeps import limits read-only without settings permission, locks managed rows, and hides them without the capability", async () => {
