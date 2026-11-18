@@ -26,6 +26,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -986,11 +987,14 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         const claudeHomePath = yield* makeTempDir("t3code-window-claude-");
         const codexHomePath = yield* makeTempDir("t3code-window-codex-");
         const mixedWorkspace = yield* makeTempDir("t3code-window-mixed-");
+        const codexWorkspace = yield* makeTempDir("t3code-window-codex-recent-");
         const olderWorkspace = yield* makeTempDir("t3code-window-older-");
+        const daysAgo = (days: number) => nowMs - days * 24 * 60 * 60 * 1000;
 
         for (const [workspace, name, ageDays] of [
           [mixedWorkspace, "recent", 1],
           [mixedWorkspace, "old", 31],
+          [codexWorkspace, "older-claude", 50],
           [olderWorkspace, "older", 45],
           [olderWorkspace, "oldest", 60],
         ] as const) {
@@ -1002,25 +1006,55 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
               `${name}.jsonl`,
             ),
             contents: claudeSessionLine(workspace),
-            mtimeMs: nowMs - ageDays * 24 * 60 * 60 * 1000,
+            mtimeMs: daysAgo(ageDays),
+          });
+        }
+        for (const [workspace, month, day, ageDays] of [
+          [mixedWorkspace, "06", "25", 60],
+          [codexWorkspace, "08", "22", 2],
+        ] as const) {
+          yield* writeTranscript({
+            filePath: path.join(
+              codexHomePath,
+              "sessions",
+              "2026",
+              month,
+              day,
+              `rollout-${path.basename(workspace)}.jsonl`,
+            ),
+            contents: codexRolloutLine(workspace),
+            mtimeMs: daysAgo(ageDays),
           });
         }
 
         for (const [agentSessionImport, expected] of [
           [
             undefined,
-            { candidates: [{ path: mixedWorkspace, threadCount: 1 }], olderProjectCount: 1 },
+            {
+              candidates: [
+                { path: mixedWorkspace, threadCount: 1, sources: ["claudeAgent"] },
+                { path: codexWorkspace, threadCount: 1, sources: ["codex"] },
+              ],
+              olderProjectCount: 1,
+            },
           ],
           [
             { windowDays: 40 },
-            { candidates: [{ path: mixedWorkspace, threadCount: 2 }], olderProjectCount: 1 },
+            {
+              candidates: [
+                { path: mixedWorkspace, threadCount: 2, sources: ["claudeAgent"] },
+                { path: codexWorkspace, threadCount: 1, sources: ["codex"] },
+              ],
+              olderProjectCount: 1,
+            },
           ],
           [
             { windowDays: null },
             {
               candidates: [
-                { path: mixedWorkspace, threadCount: 2 },
-                { path: olderWorkspace, threadCount: 2 },
+                { path: mixedWorkspace, threadCount: 3, sources: ["claudeAgent", "codex"] },
+                { path: codexWorkspace, threadCount: 2, sources: ["claudeAgent", "codex"] },
+                { path: olderWorkspace, threadCount: 2, sources: ["claudeAgent"] },
               ],
               olderProjectCount: undefined,
             },
@@ -1033,7 +1067,11 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           });
 
           expect({
-            candidates: result.candidates.map(({ path, threadCount }) => ({ path, threadCount })),
+            candidates: result.candidates.map(({ path, threadCount, sources }) => ({
+              path,
+              threadCount,
+              sources,
+            })),
             olderProjectCount: result.olderProjectCount,
           }).toEqual(expected);
         }
@@ -2572,6 +2610,154 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           expect(outcomes.map((outcome) => outcome._tag)).toEqual(expected);
           expect(outcomes[1]).toMatchObject({ thread: { providerSessionId: "older" } });
         }
+      }),
+    );
+
+    it.effect(
+      "later attempts skip known failures and T3-owned transcripts without spending the budget",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+          yield* TestClock.setTime(nowMs);
+          const claudeHomePath = yield* makeTempDir("t3code-known-failures-claude-");
+          const codexHomePath = yield* makeTempDir("t3code-known-failures-codex-");
+          const workspace = yield* makeTempDir("t3code-known-failures-workspace-");
+          for (const [index, [sessionId, recordCount]] of (
+            [
+              ["large-0", 1_500],
+              ["large-1", 1_500],
+              ["large-2", 1_500],
+              ["small-0", 10],
+              ["small-1", 10],
+            ] as const
+          ).entries()) {
+            yield* writeTranscript({
+              filePath: path.join(
+                claudeHomePath,
+                "pi-agent",
+                "sessions",
+                "--workspace--",
+                `${sessionId}.jsonl`,
+              ),
+              contents: makePiToolResultTranscript(sessionId, workspace, recordCount),
+              mtimeMs: nowMs - (index + 1) * 60_000,
+            });
+          }
+
+          const attempts = yield* Effect.gen(function* () {
+            const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+            const settings = yield* ServerSettings.ServerSettingsService;
+            const attempt = (ownedSources: ReadonlyArray<AgentSessionImportSource>) =>
+              scanner.recentThreads(workspace, [], ownedSources).pipe(
+                Stream.runCollect,
+                Effect.map((outcomes) => Array.from(outcomes)),
+              );
+            const importedSources = (
+              outcomes: ReadonlyArray<AgentSessionScanner.AgentSessionRecentThread>,
+            ) =>
+              outcomes.flatMap((outcome) =>
+                outcome._tag === "Importable" ? [outcome.source] : [],
+              );
+            const first = yield* attempt([]);
+            const second = yield* attempt([]);
+            const third = yield* attempt(importedSources(second));
+            yield* settings.updateSettings({
+              agentSessionImport: { recordsPerConversation: 2_000 },
+            });
+            const fourth = yield* attempt([...importedSources(second), ...importedSources(third)]);
+            return [first, second, third, fourth].map((outcomes) =>
+              outcomes.map((outcome) =>
+                outcome._tag === "Importable" ? outcome.thread.providerSessionId : outcome._tag,
+              ),
+            );
+          }).pipe(
+            Effect.provide(
+              layerScannerTest({
+                claudeHomePath,
+                codexHomePath,
+                agentSessionImport: { conversationsPerRun: 2, recordsPerConversation: 1_000 },
+              }),
+            ),
+          );
+
+          expect(attempts).toEqual([
+            ["Skipped", "Skipped", "Deferred", "Deferred", "Deferred"],
+            ["Skipped", "Skipped", "Skipped", "small-0", "Deferred"],
+            ["Skipped", "Skipped", "Skipped", "small-1"],
+            ["large-0", "large-1", "Deferred"],
+          ]);
+        }),
+    );
+
+    it.effect("retries a transcript after a read error", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-read-error-claude-");
+        const codexHomePath = yield* makeTempDir("t3code-read-error-codex-");
+        const workspace = yield* makeTempDir("t3code-read-error-workspace-");
+        const transcriptPath = path.join(
+          codexHomePath,
+          "sessions",
+          "2026",
+          "08",
+          "24",
+          "rollout-read-error.jsonl",
+        );
+        yield* writeTranscript({
+          filePath: transcriptPath,
+          contents: [
+            encodeTranscriptRecord({
+              type: "session_meta",
+              payload: { id: "read-error", cwd: workspace },
+            }),
+            encodeTranscriptRecord({
+              type: "event_msg",
+              payload: { type: "user_message", message: "Import me once the read works" },
+            }),
+          ].join("\n"),
+          mtimeMs: nowMs,
+        });
+        let transcriptOpenCount = 0;
+        // The first open reads metadata during collection; the second is the first import read.
+        const simulatedFileSystem = FileSystem.FileSystem.of({
+          ...fileSystem,
+          open: (filePath, options) => {
+            if (filePath !== transcriptPath) return fileSystem.open(filePath, options);
+            transcriptOpenCount += 1;
+            if (transcriptOpenCount !== 2) return fileSystem.open(filePath, options);
+            return Effect.fail(
+              PlatformError.systemError({
+                _tag: "Busy",
+                module: "FileSystem",
+                method: "open",
+                description: "Simulated read error.",
+              }),
+            );
+          },
+        });
+
+        const attempts = yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          const attempt = scanner.recentThreads(workspace).pipe(
+            Stream.runCollect,
+            Effect.map((outcomes) =>
+              Array.from(outcomes, (outcome) =>
+                outcome._tag === "Importable" ? outcome.thread.providerSessionId : outcome._tag,
+              ),
+            ),
+          );
+          return [yield* attempt, yield* attempt];
+        }).pipe(
+          Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })),
+          Effect.provideService(FileSystem.FileSystem, simulatedFileSystem),
+        );
+
+        expect(transcriptOpenCount).toBe(3);
+        expect(attempts).toEqual([["Skipped"], ["read-error"]]);
       }),
     );
 

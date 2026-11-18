@@ -2,7 +2,12 @@ import {
   findProjectByPath,
   normalizeProjectPathForComparison,
 } from "@t3tools/client-runtime/state/projects";
-import type { AgentSessionProjectCandidate, EnvironmentId, ProjectId } from "@t3tools/contracts";
+import type {
+  AgentSessionImportResult,
+  AgentSessionProjectCandidate,
+  EnvironmentId,
+  ProjectId,
+} from "@t3tools/contracts";
 import { msg } from "gt-react";
 
 import { m, type MessageResolver } from "../i18n/messages";
@@ -179,21 +184,86 @@ export function selectEveryProjectFound(
   return { knownKeys: keys, keys, optedOut: false, selectsFound: true };
 }
 
+export interface ProjectImportTotals {
+  readonly imported: number;
+  readonly failed: number;
+  readonly deferred: number;
+  readonly requestFailed: boolean;
+  readonly stopped: boolean;
+}
+
+export interface ProjectImportProgress {
+  readonly imported: number;
+  readonly left: number;
+}
+
 /**
- * The summary for an import that left threads behind. Deferred threads hit the per-attempt
- * budget and import on a later attempt, so they are not reported as failures.
+ * A batch moved forward when it imported something or deferred less than the one before.
+ * `importedCount` counts only new threads, so a batch that re-reads owned threads imports nothing.
  */
+function batchProgressed(
+  previous: AgentSessionImportResult | undefined,
+  current: AgentSessionImportResult,
+): boolean {
+  return (
+    previous === undefined ||
+    current.importedCount > 0 ||
+    (current.deferredCount ?? 0) < (previous.deferredCount ?? 0)
+  );
+}
+
+/**
+ * Imports one project until nothing is deferred or a batch stops moving forward. A truncated scan
+ * can hide older transcripts until imports free its budget, so it continues with nothing deferred
+ * while batches import.
+ * Known failures are re-reported by every batch, so only the last batch's failures count.
+ */
+export async function importProjectInBatches(input: {
+  readonly importBatch: () => Promise<AgentSessionImportResult | null>;
+  readonly scanTruncated: boolean;
+  readonly isStopRequested: () => boolean;
+  readonly onProgress?: (progress: ProjectImportProgress) => void;
+}): Promise<ProjectImportTotals> {
+  let imported = 0;
+  let previous: AgentSessionImportResult | undefined;
+  while (true) {
+    const current = await input.importBatch();
+    if (current === null) {
+      return {
+        imported,
+        failed: previous === undefined ? 0 : previous.skippedCount - (previous.deferredCount ?? 0),
+        deferred: previous?.deferredCount ?? 0,
+        requestFailed: true,
+        stopped: false,
+      };
+    }
+    imported += current.importedCount;
+    const deferred = current.deferredCount ?? 0;
+    input.onProgress?.({ imported, left: deferred });
+    const progressed = batchProgressed(previous, current);
+    previous = current;
+    const settled = {
+      imported,
+      failed: current.skippedCount - (progressed ? deferred : 0),
+      deferred: progressed ? deferred : 0,
+      requestFailed: false,
+    };
+    const hasMore =
+      progressed &&
+      current.deferredCount !== undefined &&
+      (deferred > 0 || (input.scanTruncated && current.importedCount > 0));
+    if (!hasMore) return { ...settled, stopped: false };
+    if (input.isStopRequested()) return { ...settled, stopped: true };
+  }
+}
+
+/** The summary for an import that left threads behind or was stopped. */
 export function projectImportWarning(
-  totals: {
-    readonly imported: number;
-    readonly failed: number;
-    readonly deferred: number;
-    readonly requestFailed: boolean;
-  },
+  totals: ProjectImportTotals,
   resolve: MessageResolver = m,
 ): string {
-  const { imported, failed, deferred, requestFailed } = totals;
-  if (failed === 0 && deferred === 0) {
+  const { imported, failed, deferred, requestFailed, stopped } = totals;
+  if (!stopped && failed === 0 && deferred === 0) {
     return imported > 0
       ? resolve(
           msg(
@@ -204,6 +274,7 @@ export function projectImportWarning(
       : resolve(msg("Could not import thread history."));
   }
   const sentences: Array<string> = [];
+  if (stopped) sentences.push(resolve(msg("Import stopped.")));
   if (imported > 0) {
     sentences.push(
       resolve(
@@ -233,14 +304,40 @@ export function projectImportWarning(
           { count: deferred },
         ),
       ),
-      resolve(
-        msg(
-          "To import them, open the Welcome page again from Settings → About and select their projects under Review all.",
-        ),
-      ),
     );
   }
   return sentences.join(" ");
+}
+
+export function formatImportProgress(
+  input: {
+    readonly title: string;
+    readonly position: number;
+    readonly total: number;
+    readonly progress: ProjectImportProgress | null;
+  },
+  resolve: MessageResolver = m,
+): string {
+  const { title, position, total, progress } = input;
+  const label =
+    total > 1
+      ? resolve(msg("Importing {title} ({position} of {total})…", { title, position, total }))
+      : resolve(msg("Importing {title}…", { title }));
+  if (progress === null) return label;
+  const detail =
+    progress.left > 0
+      ? resolve(
+          msg(
+            "{count, plural, one {{count} thread imported, {left} left} other {{count} threads imported, {left} left}}",
+            { count: progress.imported, left: progress.left },
+          ),
+        )
+      : resolve(
+          msg("{count, plural, one {{count} thread imported} other {{count} threads imported}}", {
+            count: progress.imported,
+          }),
+        );
+  return `${label} ${detail}`;
 }
 
 export function splitOnboardingProjectPath(path: string): {

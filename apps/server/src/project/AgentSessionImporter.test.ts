@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import {
+  type AgentSessionImportSource,
   type AgentSessionSource,
   type ServerSettingsError,
   EventId,
@@ -201,6 +202,7 @@ const makeImporter = Effect.fn(function* (
   const events = yield* EventStore.EventStoreV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const published: Array<ApplicationStoredEvent> = [];
+  const ownedSourceCalls: Array<ReadonlyArray<AgentSessionImportSource>> = [];
   const withTransaction: typeof sql.withTransaction = (effect) =>
     beforeTransaction.pipe(Effect.andThen(sql.withTransaction(effect)));
   const importSql = new Proxy(sql, {
@@ -239,7 +241,10 @@ const makeImporter = Effect.fn(function* (
           ),
           realScan === undefined
             ? Layer.mock(AgentSessionScanner.AgentSessionScanner)({
-                recentThreads: () => Stream.fromIterable(candidates),
+                recentThreads: (_workspaceRoot, _completedSources, ownedSources = []) => {
+                  ownedSourceCalls.push(ownedSources);
+                  return Stream.fromIterable(candidates);
+                },
               })
             : Layer.succeed(AgentSessionScanner.AgentSessionScanner, realScan.scanner),
           Layer.mock(ProjectService.ProjectService)({
@@ -281,6 +286,7 @@ const makeImporter = Effect.fn(function* (
     run: importer.importRecentAgentThreads({ projectId }),
     importNativeHistory: importer.importNativeHistory,
     published,
+    ownedSourceCalls,
   };
 });
 
@@ -384,6 +390,12 @@ it.effect(
           },
         });
       }
+
+      yield* importer.run;
+      expect(importer.ownedSourceCalls).toEqual([
+        [],
+        [active.source, archived.source, deleted.source, ownedPi.source],
+      ]);
     }).pipe(Effect.scoped, Effect.provide(persistence)),
 );
 

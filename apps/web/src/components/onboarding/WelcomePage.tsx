@@ -27,7 +27,7 @@ import {
   ProviderDriverKind,
   ThreadId,
 } from "@t3tools/contracts";
-import { Link, useBlocker } from "@tanstack/react-router";
+import { Link, useBlocker, useNavigate } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
 import {
   CheckIcon,
@@ -60,7 +60,9 @@ import { retryClerkLoad, useClerkLoadFailed } from "../clerk/clerkLoadFailure";
 import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
 import { completeOnboarding } from "../../onboarding/firstRun";
 import {
+  formatImportProgress,
   groupOnboardingProjects,
+  importProjectInBatches,
   partitionOnboardingProjects,
   onboardingProjectKey,
   projectImportWarning,
@@ -70,6 +72,7 @@ import {
   resolveOnboardingProjectId,
   selectEveryProjectFound,
   type OnboardingProjectGroup,
+  type ProjectImportProgress,
   splitOnboardingProjectPath,
 } from "../../onboarding/projectImport.logic";
 import {
@@ -180,28 +183,16 @@ export function WelcomePage({
   const [isImporting, setIsImporting] = useState(false);
   // True from Start until the landing; leaving earlier would drop the import or the landing.
   const holdPageRef = useRef(false);
-  useBlocker({
-    shouldBlockFn: () => {
-      if (!holdPageRef.current) return false;
-      toastManager.add({
-        id: "welcome-finishing",
-        type: "info",
-        title: gt("Finishing setup"),
-        description: gt("One moment."),
-      });
-      return true;
-    },
-    // Electron cancels a quit silently when unload is blocked. A later visit resumes the import.
-    enableBeforeUnload: false,
-  });
   const finishingPromiseRef = useRef<Promise<boolean> | null>(null);
   // Starting before the project list loads keeps saved picks, such as an import a quit cut short.
   const keepChoicesRef = useRef(false);
   const completionErrorToastIdRef = useRef<ReturnType<typeof toastManager.add> | null>(null);
+  const navigate = useNavigate();
   const finish = (
     projectRef?: ScopedProjectRef,
     importWarning?: string,
     importedThreadCount = 0,
+    resume?: WelcomeImportSelection,
   ) => {
     if (finishingPromiseRef.current !== null) return finishingPromiseRef.current;
     if (completionErrorToastIdRef.current !== null) {
@@ -219,13 +210,29 @@ export function WelcomePage({
         // Release before onDone so its own navigation is not blocked.
         holdPageRef.current = false;
         await onDone(projectRef);
-        if (!keepChoicesRef.current) setImportSelection(null);
+        if (resume !== undefined) setImportSelection(resume);
+        else if (!keepChoicesRef.current) setImportSelection(null);
         if (importWarning) {
-          toastManager.add({
+          const toastId = toastManager.add({
             type: "warning",
             title: gt("Some history was not imported"),
             description: importWarning,
             timeout: 0,
+            ...(resume === undefined
+              ? {}
+              : {
+                  actionProps: {
+                    children: gt("Continue import"),
+                    onClick: () => {
+                      toastManager.close(toastId);
+                      void navigate(
+                        isPrimary
+                          ? { to: "/welcome" }
+                          : { to: "/welcome", hash: `agents:${environmentId}` },
+                      );
+                    },
+                  },
+                }),
           });
         } else if (importedThreadCount > 0) {
           toastManager.add({
@@ -268,6 +275,24 @@ export function WelcomePage({
     setIsImporting,
     holdPageRef,
     onDone: finish,
+  });
+  useBlocker({
+    shouldBlockFn: () => {
+      if (!holdPageRef.current) return false;
+      toastManager.add({
+        id: "welcome-finishing",
+        type: "info",
+        ...(projectImport.progress === null
+          ? { title: gt("Finishing setup"), description: gt("One moment.") }
+          : {
+              title: gt("Importing projects"),
+              description: gt("Select Stop importing to finish after the current batch."),
+            }),
+      });
+      return true;
+    },
+    // Electron cancels a quit silently when unload is blocked. A later visit resumes the import.
+    enableBeforeUnload: false,
   });
   const importOptions = useWelcomeImportOptions(environmentId, scans[0], (patch) => {
     if (patch.windowDays === null) projectImport.selectEveryProjectFound();
@@ -325,7 +350,15 @@ export function WelcomePage({
               {showPhone ? <PhoneSection environmentId={environmentId} /> : null}
             </div>
             <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
-              {agentReady ? (
+              {projectImport.progress !== null ? (
+                <Button
+                  variant="ghost-muted"
+                  disabled={projectImport.isStopping}
+                  onClick={projectImport.stopImport}
+                >
+                  {projectImport.isStopping ? gt("Stopping…") : gt("Stop importing")}
+                </Button>
+              ) : agentReady ? (
                 <span />
               ) : (
                 <Button
@@ -841,6 +874,7 @@ function ProjectsSection({
     candidates,
     isNew,
     olderCount,
+    progress,
     recent,
     selected,
     selectedKeys,
@@ -963,6 +997,11 @@ function ProjectsSection({
           </Button>
         ) : null}
       </div>
+      {progress !== null ? (
+        <p className="pl-8 text-xs text-muted-foreground" role="status">
+          {formatImportProgress(progress, m)}
+        </p>
+      ) : null}
       {reviewing && canWrite ? (
         // The negative margin lines the list's checkboxes up with the one above it.
         <fieldset className="-mx-1.5 mt-1 min-w-0" disabled={isImporting}>
@@ -1545,12 +1584,12 @@ function useProjectImport({
     projectRef?: ScopedProjectRef,
     importWarning?: string,
     importedThreadCount?: number,
+    resume?: WelcomeImportSelection,
   ) => Promise<boolean>;
 }) {
   const writableEnvironments = useEnvironmentsWithScope(scans, AuthOrchestrationOperateScope);
   const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
   const importThreads = useAtomCommand(agentSessionImport, { reportFailure: false });
-  const importWarningRef = useRef("");
   // Per project, so a retry that skips finished projects still counts their threads.
   const importedThreadsRef = useRef(new Map<string, number>());
   const importedProjectsRef = useRef(new Map<string, ScopedProjectRef>());
@@ -1560,6 +1599,14 @@ function useProjectImport({
     new Map<string, { readonly projectId: ProjectId; readonly commandId: CommandId }>(),
   );
   const importGenerationRef = useRef(0);
+  const stopRequestedRef = useRef(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const [progress, setProgress] = useState<{
+    readonly title: string;
+    readonly position: number;
+    readonly total: number;
+    readonly progress: ProjectImportProgress | null;
+  } | null>(null);
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- bumps the import generation on mount and unmount so in-flight imports drop stale results
   useEffect(() => {
@@ -1609,7 +1656,7 @@ function useProjectImport({
       0,
     );
 
-  const finishAfterImport = () => {
+  const finishAfterImport = (importWarning = "", resume?: WelcomeImportSelection) => {
     const projectRef = resolveOnboardingLandingProject(
       lastImportSelectionRef.current,
       projectsWithImportedHistoryRef.current,
@@ -1618,7 +1665,7 @@ function useProjectImport({
     // Busy until setup is saved, so Start cannot run the import again meanwhile.
     setIsImporting(true);
     if (projectRef === undefined) {
-      void onDone(undefined, importWarningRef.current, importedThreadTotal()).then((completed) => {
+      void onDone(undefined, importWarning, importedThreadTotal(), resume).then((completed) => {
         if (!completed) setIsImporting(false);
       });
       return;
@@ -1637,7 +1684,7 @@ function useProjectImport({
           holdPageRef.current = false;
           return;
         }
-        const completed = await onDone(landing, importWarningRef.current, importedThreadTotal());
+        const completed = await onDone(landing, importWarning, importedThreadTotal(), resume);
         if (!completed) setIsImporting(false);
       });
   };
@@ -1648,37 +1695,50 @@ function useProjectImport({
       selection.every((candidate) =>
         readEnvironmentScope(candidate.environmentId, AuthOrchestrationOperateScope),
       );
+    const endRun = () => {
+      setIsImporting(false);
+      setProgress(null);
+      setIsStopping(false);
+    };
     // The permission message shows from the session's scopes.
-    const stopForDeniedAccess = () => setIsImporting(false);
     if (!hasAccess()) {
-      stopForDeniedAccess();
+      endRun();
       return;
     }
     setIsImporting(true);
-    importWarningRef.current = "";
+    stopRequestedRef.current = false;
+    setIsStopping(false);
     lastImportSelectionRef.current = selection.map((candidate) => candidate.key);
     const importGeneration = importGenerationRef.current;
+    const isCurrentRun = () => importGeneration === importGenerationRef.current;
     const importedThreads = importedThreadsRef.current;
     const importedProjects = importedProjectsRef.current;
     const projectAttempts = projectAttemptsRef.current;
-    let importedProjectsCount =
-      importedProjects.size > 0
-        ? selection.filter((candidate) => importedProjects.has(candidate.key)).length
-        : 0;
-    let skippedThreadCount = 0;
+    let failedThreadCount = 0;
     let deferredThreadCount = 0;
     let requestFailed = false;
+    let stopped = false;
     const refreshEnvironments = new Set<EnvironmentId>();
     // Resolves false when the run stopped early: a newer run, an unmount, or lost access.
     const importEach = async () => {
-      for (const candidate of selection) {
+      for (const [index, candidate] of selection.entries()) {
         const { environmentId } = candidate;
-        if (importGeneration !== importGenerationRef.current) return false;
+        if (!isCurrentRun()) return false;
         if (!hasAccess()) {
-          stopForDeniedAccess();
+          endRun();
           return false;
         }
         if (importedProjects.has(candidate.key)) continue;
+        if (stopRequestedRef.current) {
+          stopped = true;
+          return true;
+        }
+        const projectProgress = {
+          title: candidate.title,
+          position: index + 1,
+          total: selection.length,
+        };
+        setProgress({ ...projectProgress, progress: null });
         let projectId = resolveOnboardingProjectId(readProjects(), environmentId, candidate);
         if (projectId === null) {
           let attempt = projectAttempts.get(candidate.key);
@@ -1702,7 +1762,7 @@ function useProjectImport({
               defaultModelSelection: null,
             },
           });
-          if (importGeneration !== importGenerationRef.current) return false;
+          if (!isCurrentRun()) return false;
           if (result._tag !== "Success") {
             requestFailed = true;
             if (!isAtomCommandInterrupted(result)) {
@@ -1714,37 +1774,63 @@ function useProjectImport({
         }
 
         if (!hasAccess()) {
-          stopForDeniedAccess();
+          endRun();
           return false;
         }
-        const threadImportResult = await importThreads({
-          environmentId,
-          input: { projectId, expectedWorkspaceRoot: candidate.path },
+        if (stopRequestedRef.current) {
+          stopped = true;
+          return true;
+        }
+        const importingProjectId = projectId;
+        const totals = await importProjectInBatches({
+          scanTruncated: scans.some(
+            (scan) => scan.environmentId === environmentId && scan.data?.truncated === true,
+          ),
+          isStopRequested: () => stopRequestedRef.current || !isCurrentRun() || !hasAccess(),
+          onProgress: (batchProgress) =>
+            setProgress({ ...projectProgress, progress: batchProgress }),
+          importBatch: async () => {
+            const result = await importThreads({
+              environmentId,
+              input: { projectId: importingProjectId, expectedWorkspaceRoot: candidate.path },
+            });
+            if (!isCurrentRun()) return null;
+            if (result._tag !== "Success") {
+              if (!isAtomCommandInterrupted(result)) {
+                projectAttempts.delete(candidate.key);
+                refreshEnvironments.add(environmentId);
+              }
+              return null;
+            }
+            return result.value;
+          },
         });
-        if (importGeneration !== importGenerationRef.current) return false;
-        if (threadImportResult._tag === "Success") {
-          importedThreads.set(
+        if (!isCurrentRun()) return false;
+        if (totals.stopped && !stopRequestedRef.current) {
+          endRun();
+          return false;
+        }
+        importedThreads.set(
+          candidate.key,
+          (importedThreads.get(candidate.key) ?? 0) + totals.imported,
+        );
+        if (totals.imported > 0) {
+          projectsWithImportedHistoryRef.current.set(
             candidate.key,
-            (importedThreads.get(candidate.key) ?? 0) + threadImportResult.value.importedCount,
+            scopeProjectRef(environmentId, importingProjectId),
           );
-          skippedThreadCount += threadImportResult.value.skippedCount;
-          deferredThreadCount += threadImportResult.value.deferredCount ?? 0;
-          if (threadImportResult.value.importedCount > 0) {
-            projectsWithImportedHistoryRef.current.set(
-              candidate.key,
-              scopeProjectRef(environmentId, projectId),
-            );
-          }
-          if (threadImportResult.value.skippedCount === 0) {
-            importedProjectsCount += 1;
-            importedProjects.set(candidate.key, scopeProjectRef(environmentId, projectId));
-          }
-        } else {
-          requestFailed = true;
-          if (!isAtomCommandInterrupted(threadImportResult)) {
-            projectAttempts.delete(candidate.key);
-            refreshEnvironments.add(environmentId);
-          }
+        }
+        failedThreadCount += totals.failed;
+        deferredThreadCount += totals.deferred;
+        requestFailed = requestFailed || totals.requestFailed;
+        stopped = stopped || totals.stopped;
+        if (
+          !totals.requestFailed &&
+          !totals.stopped &&
+          totals.failed === 0 &&
+          totals.deferred === 0
+        ) {
+          importedProjects.set(candidate.key, scopeProjectRef(environmentId, importingProjectId));
         }
       }
       return true;
@@ -1757,17 +1843,33 @@ function useProjectImport({
     for (const scan of scans) {
       if (refreshEnvironments.has(scan.environmentId)) scan.refresh();
     }
-    setIsImporting(false);
-    const importedThreadCount = importedThreadTotal();
-    if (importedProjectsCount < selection.length) {
-      importWarningRef.current = projectImportWarning({
-        imported: importedThreadCount,
-        failed: skippedThreadCount - deferredThreadCount,
+    endRun();
+    const unfinished = selection.filter((candidate) => !importedProjects.has(candidate.key));
+    if (unfinished.length === 0) {
+      finishAfterImport();
+      return;
+    }
+    finishAfterImport(
+      projectImportWarning({
+        imported: importedThreadTotal(),
+        failed: failedThreadCount,
         deferred: deferredThreadCount,
         requestFailed,
-      });
-    }
-    finishAfterImport();
+        stopped,
+      }),
+      stopped || deferredThreadCount > 0
+        ? {
+            knownKeys: candidates.map((candidate) => candidate.key),
+            keys: unfinished.map((candidate) => candidate.key),
+            optedOut: false,
+          }
+        : undefined,
+    );
+  };
+
+  const stopImport = () => {
+    stopRequestedRef.current = true;
+    setIsStopping(true);
   };
 
   return {
@@ -1783,6 +1885,9 @@ function useProjectImport({
     visibleImportError,
     runImport,
     finishAfterImport,
+    progress,
+    isStopping,
+    stopImport,
   };
 }
 

@@ -18,6 +18,7 @@ import {
   type EnvironmentCloudLinkStateResult,
   type ServerProvider,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import { AsyncResult, Atom } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
 import { page } from "vite-plus/test/browser";
@@ -834,6 +835,121 @@ it("starts without importing when this connection cannot import projects", async
   await click("Start");
   await vi.waitFor(() => expect(state.onDone).toHaveBeenCalledOnce());
   expect(state.createProject).not.toHaveBeenCalled();
+});
+
+it("imports in batches with a progress line, and Stop importing finishes after the current batch", async () => {
+  using _now = setup();
+  const secondBatch = deferred<{
+    importedCount: number;
+    skippedCount: number;
+    deferredCount: number;
+  }>();
+  state.importThreads
+    .mockResolvedValueOnce(
+      AsyncResult.success({ importedCount: 2, skippedCount: 5, deferredCount: 5 }),
+    )
+    .mockImplementationOnce(async () => AsyncResult.success(await secondBatch.promise));
+  await using _screen = await mountWelcome();
+  using toastAdd = vi.spyOn(toastManager, "add");
+
+  await click("Import 2 projects and start");
+  await vi.waitFor(() =>
+    expect(pageText()).toContain("Importing first (1 of 2)… 2 threads imported, 5 left"),
+  );
+  expect(state.importThreads).toHaveBeenCalledTimes(2);
+  await click("Stop importing");
+  expect(button("Stopping…").disabled).toBe(true);
+  await act(async () => {
+    secondBatch.resolve({ importedCount: 4, skippedCount: 3, deferredCount: 3 });
+    await secondBatch.promise;
+  });
+
+  await vi.waitFor(() => expect(state.onDone).toHaveBeenCalledOnce());
+  expect(state.importThreads).toHaveBeenCalledTimes(2);
+  expect(state.createProject).toHaveBeenCalledOnce();
+  await vi.waitFor(() =>
+    expect(toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Some history was not imported",
+        description: "Import stopped. Imported 6 threads. 3 threads were not imported yet.",
+        actionProps: expect.objectContaining({ children: "Continue import" }),
+      }),
+    ),
+  );
+});
+
+it("Stop importing while a project is being created skips its history", async () => {
+  using _now = setup();
+  const creation = deferred<void>();
+  state.createProject.mockImplementationOnce(async (input: CreateProjectInput) => {
+    await creation.promise;
+    return recordProject(input);
+  });
+  await using _screen = await mountWelcome();
+  using toastAdd = vi.spyOn(toastManager, "add");
+
+  await click("Import 2 projects and start");
+  await click("Stop importing");
+  await act(async () => {
+    creation.resolve();
+    await creation.promise;
+  });
+
+  await vi.waitFor(() => expect(state.onDone).toHaveBeenCalledOnce());
+  expect(state.createProject).toHaveBeenCalledOnce();
+  expect(state.importThreads).not.toHaveBeenCalled();
+  await vi.waitFor(() =>
+    expect(toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: "Import stopped.",
+        actionProps: expect.objectContaining({ children: "Continue import" }),
+      }),
+    ),
+  );
+});
+
+it("Continue import reopens the page with the unfinished projects checked", async () => {
+  using _now = setup();
+  state.importThreads
+    .mockResolvedValueOnce(
+      AsyncResult.success({ importedCount: 1, skippedCount: 0, deferredCount: 0 }),
+    )
+    .mockResolvedValueOnce(
+      AsyncResult.success({ importedCount: 1, skippedCount: 3, deferredCount: 3 }),
+    )
+    .mockResolvedValueOnce(AsyncResult.failure(Cause.fail(new Error("offline"))));
+  {
+    await using screen = await mountWelcome();
+    using toastAdd = vi.spyOn(toastManager, "add");
+    await click("Import 2 projects and start");
+    await vi.waitFor(() => expect(state.onDone).toHaveBeenCalledOnce());
+    const summary = await vi.waitFor(() => {
+      const toast = toastAdd.mock.calls
+        .map(([options]) => options)
+        .find((options) => options.actionProps?.children === "Continue import");
+      expect(toast).toBeDefined();
+      return toast;
+    });
+    await act(async () => summary?.actionProps?.onClick?.(new MouseEvent("click") as never));
+    await vi.waitFor(() => expect(screen.router?.state.location.pathname).toBe("/welcome"));
+  }
+
+  await using _reopened = await mountWelcome();
+  await vi.waitFor(() => expect(pageText()).toContain("Import 1 project and their threads"));
+  await click("Review all 2");
+  expect(listedCheckboxes().map((checkbox) => checkbox.getAttribute("aria-checked"))).toEqual([
+    "false",
+    "true",
+  ]);
+  await click("Import threads and start");
+  await vi.waitFor(() => expect(state.onDone).toHaveBeenCalledTimes(2));
+  expect(state.importThreads).toHaveBeenCalledTimes(4);
+  expect(state.importThreads).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      input: expect.objectContaining({ expectedWorkspaceRoot: "/projects/second" }),
+    }),
+  );
+  expect(state.createProject).toHaveBeenCalledTimes(2);
 });
 
 // Two repositories and a folder are in the window; a project with only older conversations is

@@ -1,8 +1,15 @@
-import { EnvironmentId, ProjectId, type AgentSessionProjectCandidate } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProjectId,
+  type AgentSessionImportResult,
+  type AgentSessionProjectCandidate,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  formatImportProgress,
   groupOnboardingProjects,
+  importProjectInBatches,
   isNewOnboardingProject,
   partitionOnboardingProjects,
   onboardingProjectKey,
@@ -236,36 +243,153 @@ describe("resolveOnboardingLandingProject", () => {
 });
 
 describe("projectImportWarning", () => {
-  const resume =
-    "To import them, open the Welcome page again from Settings → About and select their projects under Review all.";
-
   it.each([
     {
-      totals: { imported: 100, failed: 0, deferred: 153, requestFailed: false },
-      warning: `Imported 100 threads. 153 threads were not imported yet. ${resume}`,
+      totals: { imported: 100, failed: 0, deferred: 153, requestFailed: false, stopped: false },
+      warning: "Imported 100 threads. 153 threads were not imported yet.",
     },
     {
-      totals: { imported: 100, failed: 3, deferred: 1, requestFailed: false },
-      warning: `Imported 100 threads. 3 threads could not be imported. 1 thread was not imported yet. ${resume}`,
+      totals: { imported: 100, failed: 3, deferred: 1, requestFailed: false, stopped: false },
+      warning:
+        "Imported 100 threads. 3 threads could not be imported. 1 thread was not imported yet.",
     },
     {
-      totals: { imported: 100, failed: 0, deferred: 53, requestFailed: true },
-      warning: `Imported 100 threads. Some thread history could not be imported. 53 threads were not imported yet. ${resume}`,
+      totals: { imported: 100, failed: 0, deferred: 53, requestFailed: true, stopped: false },
+      warning:
+        "Imported 100 threads. Some thread history could not be imported. 53 threads were not imported yet.",
     },
     {
-      totals: { imported: 0, failed: 2, deferred: 0, requestFailed: false },
+      totals: { imported: 0, failed: 2, deferred: 0, requestFailed: false, stopped: false },
       warning: "2 threads could not be imported.",
     },
     {
-      totals: { imported: 5, failed: 0, deferred: 0, requestFailed: true },
+      totals: { imported: 5, failed: 0, deferred: 0, requestFailed: true, stopped: false },
       warning: "Imported 5 threads. Some thread history could not be imported.",
     },
     {
-      totals: { imported: 0, failed: 0, deferred: 0, requestFailed: true },
+      totals: { imported: 0, failed: 0, deferred: 0, requestFailed: true, stopped: false },
       warning: "Could not import thread history.",
+    },
+    {
+      totals: { imported: 4, failed: 0, deferred: 3, requestFailed: false, stopped: true },
+      warning: "Import stopped. Imported 4 threads. 3 threads were not imported yet.",
+    },
+    {
+      totals: { imported: 0, failed: 0, deferred: 0, requestFailed: false, stopped: true },
+      warning: "Import stopped.",
     },
   ])("separates deferred threads from failures: $warning", ({ totals, warning }) => {
     expect(projectImportWarning(totals)).toBe(warning);
+  });
+});
+
+describe("importProjectInBatches", () => {
+  const batch = (
+    importedCount: number,
+    skippedCount: number,
+    deferredCount?: number,
+  ): AgentSessionImportResult =>
+    deferredCount === undefined
+      ? { importedCount, skippedCount }
+      : { importedCount, skippedCount, deferredCount };
+
+  it.each([
+    {
+      name: "continues while the deferred work shrinks and sums the imported threads",
+      batches: [batch(100, 160, 153), batch(100, 60, 53), batch(50, 7, 0)],
+      result: { imported: 250, failed: 7, deferred: 0, requestFailed: false, stopped: false },
+      progress: [
+        { imported: 100, left: 153 },
+        { imported: 200, left: 53 },
+        { imported: 250, left: 0 },
+      ],
+    },
+    {
+      name: "stops after a batch without progress and counts what is left as failed",
+      batches: [batch(2, 6, 5), batch(0, 6, 5), batch(5, 0, 0)],
+      result: { imported: 2, failed: 6, deferred: 0, requestFailed: false, stopped: false },
+      progress: [
+        { imported: 2, left: 5 },
+        { imported: 2, left: 5 },
+      ],
+    },
+    {
+      name: "imports one batch from a server without deferred counts",
+      batches: [batch(3, 2), batch(4, 0)],
+      result: { imported: 3, failed: 2, deferred: 0, requestFailed: false, stopped: false },
+      progress: [{ imported: 3, left: 0 }],
+    },
+    {
+      name: "continues a truncated scan while batches import, then stops",
+      scanTruncated: true,
+      batches: [batch(2, 0, 0), batch(1, 0, 0), batch(0, 0, 0), batch(4, 0, 0)],
+      result: { imported: 3, failed: 0, deferred: 0, requestFailed: false, stopped: false },
+      progress: [
+        { imported: 2, left: 0 },
+        { imported: 3, left: 0 },
+        { imported: 3, left: 0 },
+      ],
+    },
+    {
+      name: "does not retry a truncated scan after a first batch that imports nothing",
+      scanTruncated: true,
+      batches: [batch(0, 0, 0), batch(4, 0, 0)],
+      result: { imported: 0, failed: 0, deferred: 0, requestFailed: false, stopped: false },
+      progress: [{ imported: 0, left: 0 }],
+    },
+    {
+      name: "keeps earlier imports and the last deferred count when a later batch fails",
+      batches: [batch(2, 6, 5), null, batch(5, 0, 0)],
+      result: { imported: 2, failed: 1, deferred: 5, requestFailed: true, stopped: false },
+      progress: [{ imported: 2, left: 5 }],
+    },
+    {
+      name: "reports a stop requested after the first batch with its deferred count",
+      stopAfter: 1,
+      batches: [batch(2, 5, 5), batch(4, 3, 3)],
+      result: { imported: 2, failed: 0, deferred: 5, requestFailed: false, stopped: true },
+      progress: [{ imported: 2, left: 5 }],
+    },
+  ])("$name", async ({ batches, scanTruncated = false, stopAfter, result, progress }) => {
+    const pending = [...batches];
+    let requested = 0;
+    const reported: Array<{ readonly imported: number; readonly left: number }> = [];
+
+    const totals = await importProjectInBatches({
+      scanTruncated,
+      importBatch: async () => {
+        requested += 1;
+        return pending.shift() ?? null;
+      },
+      isStopRequested: () => stopAfter !== undefined && requested >= stopAfter,
+      onProgress: (next) => reported.push(next),
+    });
+
+    expect(totals).toEqual(result);
+    expect(reported).toEqual(progress);
+  });
+});
+
+describe("formatImportProgress", () => {
+  it.each([
+    { title: "web", position: 1, total: 1, progress: null, line: "Importing web…" },
+    { title: "web", position: 2, total: 3, progress: null, line: "Importing web (2 of 3)…" },
+    {
+      title: "web",
+      position: 2,
+      total: 3,
+      progress: { imported: 100, left: 153 },
+      line: "Importing web (2 of 3)… 100 threads imported, 153 left",
+    },
+    {
+      title: "web",
+      position: 2,
+      total: 3,
+      progress: { imported: 1, left: 0 },
+      line: "Importing web (2 of 3)… 1 thread imported",
+    },
+  ])("$line", ({ line, ...input }) => {
+    expect(formatImportProgress(input)).toBe(line);
   });
 });
 

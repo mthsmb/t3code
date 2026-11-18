@@ -112,17 +112,27 @@ only ran commands such as `/clear`, with no reply, is skipped. It reads one
 conversation at a time and skips files larger than 4 GiB. It also skips a conversation when the
 message text and metadata it keeps need more than 32 MiB of memory. Tool output
 does not count toward that limit. It skips a Codex or Pi conversation with more
-than 100,000 records every time, so opening the page again does not import it. It ignores
+records than the records limit (100,000 by default). Opening the page again does not
+import it unless you raise the limit. It ignores
 malformed records and conversations with no messages, such as a session opened
 in an editor but never used. It skips unreadable or unparseable conversations.
 
-Each import attempt reads up to 100 conversations and 4 GiB per project by default.
-Conversations with no messages count toward the 4 GiB but not the 100. The
-summary counts the conversations past that limit as not imported yet, separately
-from conversations that could not be imported. To continue a large batch, open
-the Welcome page again from **Settings → About** and pick the project in
-**Review all**. Completed conversations are not imported again. You can continue
-without the remaining history.
+Each project imports in batches of up to 100 conversations by default (the
+conversations per run limit) and 4 GiB. Conversations with no messages count
+toward the 4 GiB but not the 100. The page starts the next batch while each
+batch makes progress, and a line under the import box shows the project, how
+many threads were imported and how many are left. If a batch makes no progress,
+the page stops importing that project and counts the rest as conversations
+that could not be imported. Completed conversations are not imported again. A
+computer running an older T3 Code version imports one batch each time you select
+**Start**.
+
+Select **Stop importing** to finish after the current batch, without starting
+the next project. The summary counts conversations that could not be imported
+separately from those not imported yet. After a stop, or when conversations are
+not imported yet, select **Continue import** on the summary to open the Welcome
+page again with the unfinished projects checked. They also stay checked when you
+open the page from **Settings → About**. You can continue without the remaining history.
 
 You can start without importing. While an import runs, T3 Code stays on the
 Welcome page. If you quit, open the Welcome page again from **Settings → About**; the

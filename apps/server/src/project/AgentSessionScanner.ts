@@ -241,9 +241,14 @@ export class AgentSessionScanner extends Context.Service<
   AgentSessionScanner,
   {
     readonly scan: Effect.Effect<AgentSessionScanResult, AgentSessionScanError>;
+    /**
+     * Owned sources are transcripts whose native session a T3 thread already owns; an unchanged
+     * one is dropped without an outcome and without spending the attempt's budget.
+     */
     readonly recentThreads: (
       workspaceRoot: string,
       completedSources?: ReadonlyArray<AgentSessionImportSource>,
+      ownedSources?: ReadonlyArray<AgentSessionImportSource>,
     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
   }
 >()("t3/project/AgentSessionScanner") {}
@@ -885,6 +890,11 @@ type TranscriptIdentity = Pick<
   "filePath" | "size" | "mtimeMs" | "device" | "inode" | "birthtimeMs"
 >;
 
+interface TranscriptReadLimits {
+  readonly maxRecords: number;
+  readonly maxMessages: number;
+}
+
 const fileIdKey = (inode: TranscriptIdentity["inode"]) => (inode === null ? null : String(inode));
 
 function sameTranscriptIdentity(left: TranscriptIdentity, right: TranscriptIdentity): boolean {
@@ -1284,18 +1294,23 @@ export const make = Effect.gen(function* () {
     ).pipe(Effect.orElseSucceed(() => null));
   });
 
+  /**
+   * Returns "unimportable" when an unchanged file would fail the same way under the same limits
+   * (read limits, parse errors, the history budget) and null when a later read may succeed
+   * (I/O errors, a file changing mid-read).
+   */
   const readTranscript = Effect.fn("AgentSessionScanner.readTranscript")(function* (
     filePath: string,
     expected: ReturnType<typeof transcriptIdentity>,
     source: AgentSessionSource,
-    limits: { readonly maxRecords: number; readonly maxMessages: number },
+    limits: TranscriptReadLimits,
     prefix?: { readonly endByteOffset: number; readonly historyBytes: number },
   ) {
     const compressed = isCompressedTranscript(filePath);
     const readBytes =
       prefix?.endByteOffset ?? (compressed ? MAX_IMPORTED_TRANSCRIPT_BYTES : expected.size);
     if ((!compressed && readBytes > expected.size) || readBytes > MAX_IMPORTED_TRANSCRIPT_BYTES) {
-      return null;
+      return "unimportable" as const;
     }
 
     return yield* Effect.scoped(
@@ -1398,7 +1413,7 @@ export const make = Effect.gen(function* () {
                 },
                 catch: (cause) => new TranscriptParseError({ filePath, cause }),
               });
-              if (!withinBudget) return null;
+              if (!withinBudget) return "unimportable" as const;
             }
 
             if (
@@ -1408,7 +1423,7 @@ export const make = Effect.gen(function* () {
                 catch: (cause) => new TranscriptParseError({ filePath, cause }),
               }))
             )
-              return null;
+              return "unimportable" as const;
             return sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))
               ? {
                   records: source === "claudeAgent" ? claudeHistory.records() : records,
@@ -1422,6 +1437,12 @@ export const make = Effect.gen(function* () {
         ),
       ),
     ).pipe(
+      Effect.catchTags({
+        TranscriptParseError: (cause) =>
+          Effect.logWarning("Could not read imported transcript", { filePath, cause }).pipe(
+            Effect.as("unimportable" as const),
+          ),
+      }),
       Effect.catch((cause) =>
         Effect.logWarning("Could not read imported transcript", { filePath, cause }).pipe(
           Effect.as(null),
@@ -1968,6 +1989,11 @@ export const make = Effect.gen(function* () {
   });
 
   let cachedCandidates: Effect.Success<ReturnType<typeof collectCandidates>> | null = null;
+  /** Transcripts that failed deterministically, so later attempts skip them without the budget. */
+  const knownFailures = new Map<
+    string,
+    { readonly identity: TranscriptIdentity; readonly limits: TranscriptReadLimits }
+  >();
 
   const scan: AgentSessionScanner["Service"]["scan"] = Effect.gen(function* () {
     const settings = yield* readSettings;
@@ -2013,14 +2039,14 @@ export const make = Effect.gen(function* () {
       if (!existing) {
         merged.set(project.key, {
           path: project.path,
-          sources: [candidate.source],
+          sources: candidate.threadCount > 0 ? [candidate.source] : [],
           threadCount: candidate.threadCount,
           lastActiveAtMs: candidate.lastActiveAtMs,
           git: project.git,
         });
         continue;
       }
-      if (!existing.sources.includes(candidate.source)) {
+      if (candidate.threadCount > 0 && !existing.sources.includes(candidate.source)) {
         existing.sources.push(candidate.source);
       }
       existing.threadCount += candidate.threadCount;
@@ -2089,6 +2115,7 @@ export const make = Effect.gen(function* () {
   const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
     workspaceRoot: string,
     completedSources: ReadonlyArray<AgentSessionImportSource>,
+    ownedSources: ReadonlyArray<AgentSessionImportSource>,
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
@@ -2098,7 +2125,7 @@ export const make = Effect.gen(function* () {
     const settings = yield* readSettings;
     const importSettings = settings.agentSessionImport;
     const cutoffMs = importCutoffMs(importSettings.windowDays, nowMs);
-    const transcriptLimits = {
+    const transcriptLimits: TranscriptReadLimits = {
       maxRecords: importSettings.recordsPerConversation,
       maxMessages: importSettings.messagesPerThread ?? Infinity,
     };
@@ -2188,6 +2215,10 @@ export const make = Effect.gen(function* () {
       completedSources,
       (source) => `${source.providerInstanceId}\0${source.filePath}`,
     );
+    const ownedByFile = Map.groupBy(
+      ownedSources,
+      (source) => `${source.providerInstanceId}\0${source.filePath}`,
+    );
     const importedSessions = new Set<string>();
     const codexThreadNamesByHome = new Map<string, ReadonlyMap<string, string>>();
     let bytesRemaining = MAX_IMPORT_BYTES;
@@ -2236,7 +2267,7 @@ export const make = Effect.gen(function* () {
           transcriptLimits,
           { endByteOffset: base.end_byte_offset, historyBytes },
         );
-        if (inherited === null) return null;
+        if (inherited === null || inherited === "unimportable") return null;
         historyBytes = inherited.historyBytes;
         // The rollout's own session_meta names the thread; inherited ones may name a fork parent.
         prefixes.unshift(inherited.records.filter((record) => record.type !== "session_meta"));
@@ -2247,10 +2278,16 @@ export const make = Effect.gen(function* () {
     return Stream.fromIteratorSucceed(eligibleTranscripts.values(), 1).pipe(
       Stream.mapEffect(({ candidate, transcript }) =>
         Effect.gen(function* () {
-          const completed = completedByFile.get(
-            `${candidate.providerInstanceId}\0${transcript.filePath}`,
-          );
-          if (completed === undefined && (transcriptsRemaining === 0 || bytesRemaining === 0)) {
+          const fileKey = `${candidate.providerInstanceId}\0${transcript.filePath}`;
+          const completed = completedByFile.get(fileKey);
+          const knownFailure = knownFailures.get(fileKey);
+          const owned = ownedByFile.get(fileKey);
+          if (
+            completed === undefined &&
+            knownFailure === undefined &&
+            owned === undefined &&
+            (transcriptsRemaining === 0 || bytesRemaining === 0)
+          ) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Deferred" });
           }
           const stats = yield* statOption(transcript.filePath);
@@ -2271,7 +2308,21 @@ export const make = Effect.gen(function* () {
               source: completedSource,
             });
           }
-          if (identity.size > MAX_IMPORTED_TRANSCRIPT_BYTES) {
+          if (
+            owned?.some(
+              (source) =>
+                source.provider === candidate.source && sameTranscriptIdentity(source, identity),
+            )
+          ) {
+            return Option.none<AgentSessionRecentThread>();
+          }
+          if (
+            identity.size > MAX_IMPORTED_TRANSCRIPT_BYTES ||
+            (knownFailure !== undefined &&
+              knownFailure.limits.maxRecords === transcriptLimits.maxRecords &&
+              knownFailure.limits.maxMessages === transcriptLimits.maxMessages &&
+              sameTranscriptIdentity(knownFailure.identity, identity))
+          ) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
           if (transcriptsRemaining === 0 || identity.size > bytesRemaining) {
@@ -2288,8 +2339,8 @@ export const make = Effect.gen(function* () {
           if (snapshot === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
-
-          if (Option.isNone(snapshot.cwd)) {
+          if (snapshot === "unimportable" || Option.isNone(snapshot.cwd)) {
+            knownFailures.set(fileKey, { identity, limits: transcriptLimits });
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
           const expandedCwd = expandHomePath(
@@ -2338,6 +2389,10 @@ export const make = Effect.gen(function* () {
             return Option.none<AgentSessionRecentThread>();
           }
           if (parsedThread === null) {
+            // Without its history base a Codex rollout may parse once the base is readable.
+            if (candidate.source !== "codex" || inheritedRecords !== null) {
+              knownFailures.set(fileKey, { identity, limits: transcriptLimits });
+            }
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
           let savedTitle: string | undefined;
@@ -2377,7 +2432,8 @@ export const make = Effect.gen(function* () {
   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
     workspaceRoot,
     completedSources = [],
-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
+    ownedSources = [],
+  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, ownedSources));
 
   return AgentSessionScanner.of({ scan, recentThreads });
 });

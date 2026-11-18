@@ -16,6 +16,7 @@ import {
   TurnItemId,
   type AgentSessionImportInput,
   type AgentSessionImportResult,
+  type AgentSessionImportSource,
   type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
@@ -205,6 +206,8 @@ const make = Effect.gen(function* () {
   const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
+  /** Transcripts whose native session a T3 thread owns, so later attempts skip them for free. */
+  const ownedTranscripts = new Map<string, AgentSessionImportSource>();
   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
     input: AgentSessionImportInput,
   ) {
@@ -262,7 +265,9 @@ const make = Effect.gen(function* () {
         ),
       );
     })).flat();
-    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources);
+    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources, [
+      ...ownedTranscripts.values(),
+    ]);
     const importedThreadIds = new Set<ThreadId>();
     let importedCount = 0;
     let skippedCount = 0;
@@ -479,7 +484,10 @@ const make = Effect.gen(function* () {
               },
             ],
           });
-          if (committed.length === 0) return null;
+          if (committed.length === 0) {
+            ownedTranscripts.set(`${source.providerInstanceId}\0${source.filePath}`, source);
+            return null;
+          }
           yield* persistRuntime;
           yield* runtimes.recordImportedTranscript({ threadId, source });
           return true;
