@@ -314,6 +314,16 @@ describe("importProjectInBatches", () => {
       ],
     },
     {
+      name: "continues after a batch that finds a new failure, which the next batch skips",
+      batches: [batch(1, 1, 1), batch(0, 2, 1), batch(1, 1, 0)],
+      result: { imported: 2, failed: 1, deferred: 0, requestFailed: false, stopped: false },
+      progress: [
+        { imported: 1, left: 1 },
+        { imported: 1, left: 1 },
+        { imported: 2, left: 0 },
+      ],
+    },
+    {
       name: "imports one batch from a server without deferred counts",
       batches: [batch(3, 2), batch(4, 0)],
       result: { imported: 3, failed: 2, deferred: 0, requestFailed: false, stopped: false },

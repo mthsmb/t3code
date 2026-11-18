@@ -197,8 +197,12 @@ export interface ProjectImportProgress {
   readonly left: number;
 }
 
+const batchFailures = (result: AgentSessionImportResult) =>
+  result.skippedCount - (result.deferredCount ?? 0);
+
 /**
- * A batch moved forward when it imported something or deferred less than the one before.
+ * A batch moved forward when it imported something, deferred less than the one before, or found
+ * a new failure, which the server remembers so the next batch does not spend its budget on it.
  * `importedCount` counts only new threads, so a batch that re-reads owned threads imports nothing.
  */
 function batchProgressed(
@@ -208,7 +212,8 @@ function batchProgressed(
   return (
     previous === undefined ||
     current.importedCount > 0 ||
-    (current.deferredCount ?? 0) < (previous.deferredCount ?? 0)
+    (current.deferredCount ?? 0) < (previous.deferredCount ?? 0) ||
+    batchFailures(current) > batchFailures(previous)
   );
 }
 
