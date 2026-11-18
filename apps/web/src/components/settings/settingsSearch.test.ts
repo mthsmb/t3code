@@ -225,6 +225,12 @@ describe("searchSettings", () => {
       ["Native sessions", "providers"],
       ["CODEX_HOME path", "providers"],
       ["Shadow home path", "providers"],
+      ["Session import", "agent-session-import"],
+      ["Import time window", "agent-session-import-window"],
+      ["Import messages per thread", "agent-session-import-messages"],
+      ["Import conversations per run", "agent-session-import-conversations"],
+      ["Import records per conversation", "agent-session-import-records"],
+      ["Import scan budget", "agent-session-import-scan-budget"],
     ] as const) {
       expect(searchSettings(title)[0]?.id, title).toBe(id);
     }

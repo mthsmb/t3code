@@ -879,6 +879,75 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: [msg("ghq clone destination host owner repository root layout")],
   },
   {
+    id: "agent-session-import",
+    title: msg("Session import"),
+    to: "/settings/threads",
+    scope: "environment-defaults",
+    environmentOnly: true,
+    searchTerms: [
+      msg(
+        "import projects conversations sessions history limits advanced onboarding welcome claude codex pi",
+      ),
+    ],
+  },
+  {
+    id: "agent-session-import-window",
+    title: msg("Import time window"),
+    to: "/settings/threads",
+    targetId: "agent-session-import",
+    scope: "environment-defaults",
+    environmentOnly: true,
+    searchTerms: [
+      msg("import window days all history age old conversations claude codex pi sessions"),
+    ],
+  },
+  {
+    id: "agent-session-import-messages",
+    title: msg("Import messages per thread"),
+    to: "/settings/threads",
+    targetId: "agent-session-import",
+    scope: "environment-defaults",
+    environmentOnly: true,
+    searchTerms: [
+      msg("import messages per thread full history truncate thread length claude codex pi"),
+    ],
+  },
+  {
+    id: "agent-session-import-conversations",
+    title: msg("Import conversations per run"),
+    to: "/settings/threads",
+    targetId: "agent-session-import",
+    scope: "environment-defaults",
+    environmentOnly: true,
+    searchTerms: [
+      msg("import conversations per run batch per project limit claude codex pi sessions"),
+    ],
+  },
+  {
+    id: "agent-session-import-records",
+    title: msg("Import records per conversation"),
+    to: "/settings/threads",
+    targetId: "agent-session-import",
+    scope: "environment-defaults",
+    environmentOnly: true,
+    searchTerms: [
+      msg("import records per conversation transcript lines long sessions skipped codex pi"),
+    ],
+  },
+  {
+    id: "agent-session-import-scan-budget",
+    title: msg("Import scan budget"),
+    to: "/settings/threads",
+    targetId: "agent-session-import",
+    scope: "environment-defaults",
+    environmentOnly: true,
+    searchTerms: [
+      msg(
+        "import scan budget metadata MiB missing projects folders older projects claude codex pi",
+      ),
+    ],
+  },
+  {
     id: "unpin-confirmation",
     title: msg("Unpin confirmation"),
     to: "/settings/general",

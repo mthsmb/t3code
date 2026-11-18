@@ -11,6 +11,8 @@ export const WelcomeImportSelection = Schema.Struct({
   keys: Schema.Array(Schema.String),
   // Unchecking the main box also leaves out projects found later, until it is checked again.
   optedOut: Schema.Boolean,
+  // Set by turning on All history: projects found later are checked instead of getting defaults.
+  selectsFound: Schema.optionalKey(Schema.Boolean),
 });
 export type WelcomeImportSelection = typeof WelcomeImportSelection.Type;
 

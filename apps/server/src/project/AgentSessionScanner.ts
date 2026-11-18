@@ -7,6 +7,7 @@ import {
   AgentSessionScanError,
   ClaudeSettings,
   CodexSettings,
+  DEFAULT_SERVER_SETTINGS,
   ProviderDriverKind,
   ProviderInstanceId,
   resolveProviderInstanceEnabled,
@@ -14,6 +15,7 @@ import {
   type AgentSessionProjectGit,
   type AgentSessionScanResult,
   type ProviderInstanceConfig,
+  type ServerSettings as ContractServerSettings,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -77,18 +79,20 @@ const MAX_CODEX_PROJECT_ROOT_ROWS = 100_000;
 const MAX_TRANSCRIPTS_PER_SOURCE = 5000;
 
 const MAX_DISCOVERY_OPERATIONS_PER_SOURCE = MAX_TRANSCRIPTS_PER_SOURCE * 4;
-const MAX_METADATA_BYTES_PER_SOURCE = 64 * 1024 * 1024;
-const MAX_METADATA_OPERATIONS_PER_SOURCE = MAX_TRANSCRIPTS_PER_SOURCE * 4;
-const MAX_METADATA_RECORDS_PER_SOURCE = 100_000;
+const MIB = 1024 * 1024;
+const METADATA_OPERATIONS_PER_DEFAULT_BUDGET = MAX_TRANSCRIPTS_PER_SOURCE * 4;
+const METADATA_RECORDS_PER_DEFAULT_BUDGET = 100_000;
 const MAX_METADATA_RECORDS_PER_TRANSCRIPT = 1_000;
-const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_IMPORT_SETTINGS = DEFAULT_SERVER_SETTINGS.agentSessionImport;
+const importCutoffMs = (windowDays: number | null, nowMs: number) =>
+  windowDays === null ? -Infinity : nowMs - windowDays * DAY_MS;
+const scaleToScanBudget = (limit: number, scanBudgetMiB: number) =>
+  Math.ceil((limit * scanBudgetMiB) / DEFAULT_IMPORT_SETTINGS.scanBudgetMiB);
 // Screenshot-heavy transcripts can reach GiB; select fields while streaming to avoid allocating payloads.
 const MAX_IMPORTED_TRANSCRIPT_BYTES = 4 * 1024 * 1024 * 1024;
-const MAX_IMPORTED_MESSAGES = 200;
 const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
-const MAX_IMPORT_TRANSCRIPTS = 100;
-const MAX_IMPORT_RECORDS = 100_000;
 
 /**
  * open() of a file under macOS privacy protection waits on a consent prompt
@@ -160,13 +164,15 @@ const decodeClaudeSettings = Schema.decodeUnknownOption(ClaudeSettings);
 const decodeCodexSettings = Schema.decodeUnknownOption(CodexSettings);
 const decodeTranscriptRecord = Schema.decodeUnknownOption(Schema.fromJsonString(TranscriptRecord));
 const decodeTranscriptValue = Schema.decodeUnknownOption(TranscriptRecord);
-const decodePiEntryLinks = Schema.decodeUnknownOption(
-  Schema.Struct({
-    type: TranscriptRecord.fields.type,
-    id: TranscriptRecord.fields.id,
-    parentId: TranscriptRecord.fields.parentId,
-  }),
-);
+const PiEntryLinks = Schema.Struct({
+  type: TranscriptRecord.fields.type,
+  id: TranscriptRecord.fields.id,
+  parentId: TranscriptRecord.fields.parentId,
+});
+const decodePiEntryLinks = Schema.decodeUnknownOption(PiEntryLinks);
+// Link-only records skip the reader's reservations; charge a token each for the record and its links.
+const piLinkBytes = ({ type, id, parentId }: typeof PiEntryLinks.Type) =>
+  4 * 64 + 2 * ((type?.length ?? 0) + (id?.length ?? 0) + (parentId?.length ?? 0));
 const selectTranscriptPath = createTranscriptJsonSelector(TranscriptRecord);
 const decodeCodexTurnMetadata = Schema.decodeUnknownOption(CodexTurnMetadata);
 export const decodeImportedTranscriptPayload = Schema.decodeUnknownOption(
@@ -249,7 +255,6 @@ interface RawCandidate {
   readonly source: AgentSessionSource;
   readonly providerInstanceId: ProviderInstanceId;
   readonly homePath: string;
-  readonly threadCount: number;
   readonly lastActiveAtMs: number | null;
   readonly transcripts: ReadonlyArray<{
     readonly filePath: string;
@@ -494,15 +499,24 @@ export function parseAgentSessionTranscript(
   input: AgentSessionTranscriptMetadata & {
     readonly contents: string;
   },
-  lines = splitTranscriptRecords(input.contents, MAX_IMPORT_RECORDS + 1),
+  lines = splitTranscriptRecords(
+    input.contents,
+    DEFAULT_IMPORT_SETTINGS.recordsPerConversation + 1,
+  ),
 ): AgentSessionThread | null {
-  if (lines.length > MAX_IMPORT_RECORDS) return null;
+  if (lines.length > DEFAULT_IMPORT_SETTINGS.recordsPerConversation) return null;
   const records = lines.flatMap((line) => Option.toArray(decodeTranscriptRecord(line)));
   const claudeFields =
     input.source === "claudeAgent"
       ? records.reduce(foldClaudeFields, emptyClaudeFields)
       : emptyClaudeFields;
-  const thread = parseAgentSessionRecords(input, records, claudeFields, 0);
+  const thread = parseAgentSessionRecords(
+    input,
+    records,
+    claudeFields,
+    DEFAULT_IMPORT_SETTINGS.messagesPerThread ?? Infinity,
+    0,
+  );
   return thread === "empty" ? null : thread;
 }
 
@@ -510,6 +524,7 @@ function parseAgentSessionRecords(
   input: AgentSessionTranscriptMetadata,
   records: ReadonlyArray<DecodedTranscriptRecord>,
   claudeFields: ClaudeFields,
+  maxMessages: number,
   droppedMessageCount: number,
 ): AgentSessionThread | "empty" | null {
   const fallbackTimestamp = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
@@ -604,7 +619,7 @@ function parseAgentSessionRecords(
     hasAssistantMessage ||= message.role === "assistant";
     conversationMessageCount += 1;
     messages.push(message);
-    if (messages.length > MAX_IMPORTED_MESSAGES) messages.shift();
+    if (messages.length > maxMessages) messages.shift();
   };
 
   const hasMatchingCodexEventInTurn = (text: string) => {
@@ -729,7 +744,7 @@ function parseAgentSessionRecords(
   const { codexResponseUser: _codexResponseUser, ...visibleFirstUserMessage } = firstUserMessage;
   const retainedMessages = firstUserMessageRetained
     ? visibleMessages
-    : [visibleFirstUserMessage, ...visibleMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
+    : [visibleFirstUserMessage, ...visibleMessages.slice(-(maxMessages - 1))];
 
   return {
     source: input.source,
@@ -776,7 +791,7 @@ function shouldRetainDecodedRecord(
 
 // The import shows only the first user message and the latest messages, so a
 // long Claude session holds just those and counts the rest as dropped.
-function createClaudeHistoryWindow() {
+function createClaudeHistoryWindow(maxMessages: number) {
   const recent: Array<{ readonly record: DecodedTranscriptRecord; readonly bytes: number }> = [];
   let firstUser: DecodedTranscriptRecord | undefined;
   let droppedMessageCount = 0;
@@ -785,7 +800,7 @@ function createClaudeHistoryWindow() {
     push: (record: DecodedTranscriptRecord, bytes: number): number => {
       if (firstUser === undefined && record.type === "user") firstUser = record;
       recent.push({ record, bytes });
-      if (recent.length <= MAX_IMPORTED_MESSAGES) return 0;
+      if (recent.length <= maxMessages) return 0;
       const evicted = recent.shift();
       if (evicted === undefined || evicted.record === firstUser) return 0;
       droppedMessageCount += 1;
@@ -1273,6 +1288,7 @@ export const make = Effect.gen(function* () {
     filePath: string,
     expected: ReturnType<typeof transcriptIdentity>,
     source: AgentSessionSource,
+    limits: { readonly maxRecords: number; readonly maxMessages: number },
     prefix?: { readonly endByteOffset: number; readonly historyBytes: number },
   ) {
     const compressed = isCompressedTranscript(filePath);
@@ -1291,19 +1307,30 @@ export const make = Effect.gen(function* () {
             }
             const readChunk = yield* transcriptChunkReader(file, filePath);
             const records: Array<DecodedTranscriptRecord> = [];
-            const claudeHistory = createClaudeHistoryWindow();
+            const claudeHistory = createClaudeHistoryWindow(limits.maxMessages);
             let cwd = Option.none<string>();
             let claudeFields = emptyClaudeFields;
             let historyBytes = prefix?.historyBytes ?? 0;
             let recordBytes = 0;
             let bytesRead = 0;
-            const reserve = (bytes: number) => {
-              recordBytes += bytes;
-              if (historyBytes + recordBytes > MAX_IMPORT_HISTORY_BYTES) {
+            const assertHistoryFits = (bytes: number) => {
+              if (historyBytes + bytes > MAX_IMPORT_HISTORY_BYTES) {
                 throw new TranscriptJsonLimitError({
                   message: "Transcript selected history exceeds the 32 MiB memory budget",
                 });
               }
+            };
+            const reserve = (bytes: number) => {
+              recordBytes += bytes;
+              assertHistoryFits(recordBytes);
+            };
+            const retainPiLinks = (value: unknown) => {
+              const links = decodePiEntryLinks(value);
+              if (Option.isNone(links)) return;
+              const bytes = piLinkBytes(links.value);
+              assertHistoryFits(bytes);
+              historyBytes += bytes;
+              records.push(links.value);
             };
             let reader = createTranscriptJsonReader(reserve, selectTranscriptPath);
             let decoder = new TextDecoder();
@@ -1315,7 +1342,7 @@ export const make = Effect.gen(function* () {
               const decoded = decodeTranscriptValue(value);
               if (Option.isNone(decoded) && source === "pi") {
                 // Pi accepts messages this schema rejects, such as null content; keep their tree links.
-                records.push(...Option.toArray(decodePiEntryLinks(value)));
+                retainPiLinks(value);
               } else if (Option.isSome(decoded)) {
                 if (Option.isNone(cwd)) cwd = Option.fromNullOr(extractDecodedCwd(decoded.value));
                 if (source === "claudeAgent") {
@@ -1330,8 +1357,7 @@ export const make = Effect.gen(function* () {
                     !isPiConversationRecord(decoded.value)
                   ) {
                     // Tool output can dwarf the conversation; keep only the tree links.
-                    const { message: _message, ...links } = decoded.value;
-                    records.push(links);
+                    retainPiLinks(value);
                   } else {
                     records.push(decoded.value);
                     historyBytes += recordBytes;
@@ -1342,7 +1368,7 @@ export const make = Effect.gen(function* () {
               reader = createTranscriptJsonReader(reserve, selectTranscriptPath);
               decoder = new TextDecoder();
               recordStarted = false;
-              return records.length <= MAX_IMPORT_RECORDS;
+              return records.length <= limits.maxRecords;
             };
 
             while (bytesRead < readBytes) {
@@ -1750,17 +1776,18 @@ export const make = Effect.gen(function* () {
       source,
       providerInstanceId: group.providerInstanceId,
       homePath: group.homePath,
-      threadCount: group.transcripts.length,
       lastActiveAtMs: group.lastActiveAtMs,
       transcripts: group.transcripts,
     }));
   });
 
-  const collectCandidates = Effect.fn("AgentSessionScanner.collectCandidates")(function* () {
-    const settings = yield* serverSettings.getSettings.pipe(
-      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
-    );
+  const readSettings = serverSettings.getSettings.pipe(
+    Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
+  );
 
+  const collectCandidates = Effect.fn("AgentSessionScanner.collectCandidates")(function* (
+    settings: ContractServerSettings,
+  ) {
     const runtimeRows = yield* runtimes
       .list()
       .pipe(
@@ -1777,6 +1804,7 @@ export const make = Effect.gen(function* () {
       }),
       ({ source }) => `${source.providerInstanceId}\0${source.filePath}`,
     );
+    const { scanBudgetMiB } = settings.agentSessionImport;
     const raw: Array<RawCandidate> = [];
     let truncated = false;
     let metadataTruncated = false;
@@ -1912,9 +1940,12 @@ export const make = Effect.gen(function* () {
       }
       const selectedTranscripts = selectMetadataTranscripts(transcriptCandidates);
       const metadataBudget: MetadataReadBudget = {
-        bytesRemaining: MAX_METADATA_BYTES_PER_SOURCE,
-        operationsRemaining: MAX_METADATA_OPERATIONS_PER_SOURCE,
-        recordsRemaining: MAX_METADATA_RECORDS_PER_SOURCE,
+        bytesRemaining: scanBudgetMiB * MIB,
+        operationsRemaining: scaleToScanBudget(
+          METADATA_OPERATIONS_PER_DEFAULT_BUDGET,
+          scanBudgetMiB,
+        ),
+        recordsRemaining: scaleToScanBudget(METADATA_RECORDS_PER_DEFAULT_BUDGET, scanBudgetMiB),
         truncated: false,
       };
       raw.push(
@@ -1928,23 +1959,32 @@ export const make = Effect.gen(function* () {
       metadataTruncated ||= metadataBudget.truncated;
     }
 
-    return { candidates: raw, truncated: truncated || metadataTruncated, metadataTruncated };
+    return {
+      candidates: raw,
+      truncated: truncated || metadataTruncated,
+      metadataTruncated,
+      scanBudgetMiB,
+    };
   });
 
   let cachedCandidates: Effect.Success<ReturnType<typeof collectCandidates>> | null = null;
 
   const scan: AgentSessionScanner["Service"]["scan"] = Effect.gen(function* () {
-    cachedCandidates = yield* collectCandidates();
+    const settings = yield* readSettings;
+    cachedCandidates = yield* collectCandidates(settings);
     const { candidates: collected, truncated } = cachedCandidates;
     // Import skips conversations older than the window, so only those inside it count toward a
     // project. Future-dated files still count, so clock skew cannot hide a project.
-    const cutoffMs = DateTime.toEpochMillis(yield* DateTime.now) - RECENT_THREAD_WINDOW_MS;
-    const raw = collected.flatMap((candidate) => {
-      const threadCount = candidate.transcripts.filter(
+    const cutoffMs = importCutoffMs(
+      settings.agentSessionImport.windowDays,
+      DateTime.toEpochMillis(yield* DateTime.now),
+    );
+    const raw = collected.map((candidate) => ({
+      ...candidate,
+      threadCount: candidate.transcripts.filter(
         (transcript) => transcript.mtimeMs !== null && transcript.mtimeMs >= cutoffMs,
-      ).length;
-      return threadCount === 0 ? [] : [{ ...candidate, threadCount }];
-    });
+      ).length,
+    }));
 
     const merged = new Map<
       string,
@@ -2006,7 +2046,12 @@ export const make = Effect.gen(function* () {
     }
 
     const candidates: Array<AgentSessionProjectCandidate> = [];
+    let olderProjectCount = 0;
     for (const [key, entry] of merged.entries()) {
+      if (entry.threadCount === 0) {
+        olderProjectCount += 1;
+        continue;
+      }
       const importedProject =
         importedProjectsByRoot.get(normalizeProjectPathForComparison(entry.path)) ??
         importedProjectsByRoot.get(key);
@@ -2037,6 +2082,7 @@ export const make = Effect.gen(function* () {
       candidates,
       scannedAt: DateTime.formatIso(yield* DateTime.now),
       ...(truncated ? { truncated: true } : {}),
+      ...(olderProjectCount > 0 ? { olderProjectCount } : {}),
     };
   });
 
@@ -2049,11 +2095,21 @@ export const make = Effect.gen(function* () {
     if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
     const rootIdentity = yield* directoryIdentity(root);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-    const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
+    const settings = yield* readSettings;
+    const importSettings = settings.agentSessionImport;
+    const cutoffMs = importCutoffMs(importSettings.windowDays, nowMs);
+    const transcriptLimits = {
+      maxRecords: importSettings.recordsPerConversation,
+      maxMessages: importSettings.messagesPerThread ?? Infinity,
+    };
 
     // Imports recorded since a budget-truncated collection can free budget for transcripts it cut off.
-    if (cachedCandidates === null || cachedCandidates.metadataTruncated) {
-      cachedCandidates = yield* collectCandidates();
+    if (
+      cachedCandidates === null ||
+      cachedCandidates.metadataTruncated ||
+      cachedCandidates.scanBudgetMiB !== importSettings.scanBudgetMiB
+    ) {
+      cachedCandidates = yield* collectCandidates(settings);
     }
     const { candidates } = cachedCandidates;
 
@@ -2135,7 +2191,7 @@ export const make = Effect.gen(function* () {
     const importedSessions = new Set<string>();
     const codexThreadNamesByHome = new Map<string, ReadonlyMap<string, string>>();
     let bytesRemaining = MAX_IMPORT_BYTES;
-    let transcriptsRemaining = MAX_IMPORT_TRANSCRIPTS;
+    let transcriptsRemaining = importSettings.conversationsPerRun;
     const codexRolloutPaths = new Map<ProviderInstanceId, ReadonlyMap<string, string>>();
     const codexRolloutPath = (providerInstanceId: ProviderInstanceId, rolloutId: string) => {
       let paths = codexRolloutPaths.get(providerInstanceId);
@@ -2177,6 +2233,7 @@ export const make = Effect.gen(function* () {
           filePath,
           transcriptIdentity(filePath, stats.value),
           "codex",
+          transcriptLimits,
           { endByteOffset: base.end_byte_offset, historyBytes },
         );
         if (inherited === null) return null;
@@ -2222,7 +2279,12 @@ export const make = Effect.gen(function* () {
           }
           transcriptsRemaining -= 1;
           bytesRemaining -= identity.size;
-          const snapshot = yield* readTranscript(transcript.filePath, identity, candidate.source);
+          const snapshot = yield* readTranscript(
+            transcript.filePath,
+            identity,
+            candidate.source,
+            transcriptLimits,
+          );
           if (snapshot === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
@@ -2263,6 +2325,7 @@ export const make = Effect.gen(function* () {
               ? snapshot.records
               : [...inheritedRecords, ...snapshot.records],
             snapshot.claudeFields,
+            transcriptLimits.maxMessages,
             snapshot.droppedMessageCount,
           );
           if (parsedThread === "empty") {

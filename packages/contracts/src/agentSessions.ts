@@ -34,6 +34,7 @@ export const AgentSessionProjectCandidate = Schema.Struct({
   title: TrimmedNonEmptyString,
   projectId: Schema.optional(ProjectId),
   sources: Schema.Array(AgentSessionSource),
+  /** Conversations inside the import window. */
   threadCount: NonNegativeInt,
   lastActiveAt: Schema.NullOr(IsoDateTime),
   alreadyImported: Schema.Boolean,
@@ -45,6 +46,8 @@ export const AgentSessionScanResult = Schema.Struct({
   candidates: Schema.Array(AgentSessionProjectCandidate),
   scannedAt: IsoDateTime,
   truncated: Schema.optional(Schema.Boolean),
+  /** Projects whose conversations are all older than the import window; older servers omit it. */
+  olderProjectCount: Schema.optionalKey(NonNegativeInt),
 });
 export type AgentSessionScanResult = typeof AgentSessionScanResult.Type;
 

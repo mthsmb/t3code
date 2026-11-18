@@ -4,11 +4,14 @@ import {
   AuthOrchestrationReadScope,
   AuthRelayReadScope,
   AuthRelayWriteScope,
+  AuthSettingsWriteScope,
   AuthTerminalOperateScope,
+  DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  type AgentSessionImportSettings,
   type AgentSessionProjectCandidate,
   type AuthEnvironmentScope,
   type AuthSessionState,
@@ -17,6 +20,7 @@ import {
 } from "@t3tools/contracts";
 import { AsyncResult, Atom } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
+import { page } from "vite-plus/test/browser";
 
 import "~/index.css";
 import { act, render } from "../../../test/render";
@@ -27,6 +31,10 @@ type CreateProjectInput = {
   environmentId: EnvironmentId;
   input: { projectId: ProjectId; workspaceRoot: string };
 };
+type UpdateSettingsInput = {
+  environmentId: EnvironmentId;
+  input: { patch: { agentSessionImport?: Partial<AgentSessionImportSettings> } };
+};
 const state = vi.hoisted(() => ({
   sessions: new Map<string, unknown>(),
   projects: null as unknown,
@@ -36,6 +44,7 @@ const state = vi.hoisted(() => ({
   createProject: vi.fn(),
   importThreads: vi.fn(),
   refreshProviders: vi.fn(),
+  updateSettings: vi.fn(),
   completeOnboarding: vi.fn(),
   onDone: vi.fn(),
   scan: vi.fn(),
@@ -48,6 +57,8 @@ const state = vi.hoisted(() => ({
   refreshLinkState: vi.fn(),
   scanError: null as string | null,
   scanPending: false,
+  scanRefreshing: null as unknown,
+  olderProjectCount: undefined as number | undefined,
   runningTerminalIds: null as unknown,
   openTerminal: vi.fn(),
   writeTerminal: vi.fn(),
@@ -99,7 +110,14 @@ vi.mock(import("../../onboarding/firstRun"), async (original) => ({
 vi.mock(import("../../state/environments"), async (original) => ({
   ...(await original()),
   useEnvironments: (() => ({
-    environments: [{ environmentId: "primary", label: "primary" }],
+    environments: [
+      {
+        environmentId: "primary",
+        label: "primary",
+        connection: { phase: "connected" },
+        serverConfig: null,
+      },
+    ],
   })) as never,
   usePrimaryEnvironmentId: (() => "primary") as never,
 }));
@@ -112,6 +130,7 @@ vi.mock(import("../../state/server"), async (original) => {
       providersValueAtom: (() => state.providers) as never,
       configValueAtom: (() => state.config) as never,
       refreshProviders: "refreshProviders" as never,
+      updateSettings: "updateSettings" as never,
     },
   };
 });
@@ -140,12 +159,20 @@ vi.mock(import("../../onboarding/useProjectScans"), async (original) => {
       const candidates = useAtomValue(
         state.candidates as Atom.Atom<AgentSessionProjectCandidate[]>,
       );
+      const refreshing = useAtomValue(state.scanRefreshing as Atom.Atom<boolean>);
       return ids.map((environmentId) => {
         state.scan({ environmentId });
+        const data = {
+          candidates,
+          truncated: false,
+          ...(state.olderProjectCount === undefined
+            ? {}
+            : { olderProjectCount: state.olderProjectCount }),
+        };
         return {
           environmentId,
-          data: (state.scanPending ? null : { candidates, truncated: false }) as never,
-          isPending: state.scanPending,
+          data: (state.scanPending ? null : data) as never,
+          isPending: state.scanPending || refreshing,
           error: state.scanError,
           refresh: state.refreshScan,
         };
@@ -184,6 +211,7 @@ vi.mock(import("../../state/use-atom-command"), async (original) => ({
       | "createProject"
       | "importThreads"
       | "refreshProviders"
+      | "updateSettings"
       | "openTerminal"
       | "writeTerminal"
       | "closeTerminal",
@@ -234,6 +262,56 @@ function projectsAtom() {
 
 function candidatesAtom() {
   return state.candidates as Atom.Writable<ReadonlyArray<AgentSessionProjectCandidate>>;
+}
+
+function configAtom() {
+  return state.config as Atom.Writable<unknown>;
+}
+
+function scanRefreshingAtom() {
+  return state.scanRefreshing as Atom.Writable<boolean>;
+}
+
+function providersAtom() {
+  return state.providers as Atom.Writable<ReadonlyArray<ServerProvider>>;
+}
+
+function serverConfig(
+  limits: Partial<AgentSessionImportSettings> = {},
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    settings: {
+      ...DEFAULT_SERVER_SETTINGS,
+      agentSessionImport: { ...DEFAULT_SERVER_SETTINGS.agentSessionImport, ...limits },
+    },
+    environment: { capabilities: { agentSessionImportSettings: true } },
+    ...overrides,
+  };
+}
+
+function grantSettingsWrite() {
+  appAtomRegistry.set(
+    sessionAtom(primaryId),
+    AsyncResult.success(session([AuthOrchestrationOperateScope, AuthSettingsWriteScope])),
+  );
+}
+
+function saveImportLimits({ input }: UpdateSettingsInput) {
+  const config = appAtomRegistry.get(configAtom()) as ReturnType<typeof serverConfig> | null;
+  if (config !== null) {
+    appAtomRegistry.set(configAtom(), {
+      ...config,
+      settings: {
+        ...config.settings,
+        agentSessionImport: {
+          ...config.settings.agentSessionImport,
+          ...input.patch.agentSessionImport,
+        },
+      },
+    });
+  }
+  return AsyncResult.success(undefined);
 }
 
 function setGrant(environmentId: EnvironmentId, allowed: boolean) {
@@ -351,6 +429,9 @@ function setup() {
     .mockReset()
     .mockResolvedValue(AsyncResult.success({ importedCount: 1, skippedCount: 0 }));
   state.refreshProviders.mockReset().mockResolvedValue(AsyncResult.success(undefined));
+  state.updateSettings
+    .mockReset()
+    .mockImplementation(async (input: UpdateSettingsInput) => saveImportLimits(input));
   state.completeOnboarding.mockReset().mockResolvedValue(undefined);
   state.onDone.mockReset();
   state.scan.mockReset();
@@ -363,6 +444,8 @@ function setup() {
   state.refreshLinkState.mockReset();
   state.scanError = null;
   state.scanPending = false;
+  state.scanRefreshing = Atom.make(false).pipe(Atom.keepAlive);
+  state.olderProjectCount = undefined;
   state.runningTerminalIds = Atom.make<ReadonlyArray<string>>([]).pipe(Atom.keepAlive);
   for (const command of [state.openTerminal, state.writeTerminal, state.closeTerminal]) {
     command.mockReset().mockResolvedValue(AsyncResult.success(undefined));
@@ -673,7 +756,7 @@ it("checks an agent again once its install command finishes in the setup termina
   );
   appAtomRegistry.set(state.config as Atom.Writable<unknown>, {
     cwd: "/Users/dev",
-    environment: { platform: { os: "darwin" } },
+    environment: { platform: { os: "darwin" }, capabilities: {} },
     keybindings: [],
     settings: { providerInstances: {}, projectSettingsOverrides: {} },
   });
@@ -751,6 +834,216 @@ it("starts without importing when this connection cannot import projects", async
   await click("Start");
   await vi.waitFor(() => expect(state.onDone).toHaveBeenCalledOnce());
   expect(state.createProject).not.toHaveBeenCalled();
+});
+
+// Two repositories and a folder are in the window; a project with only older conversations is
+// listed once the rescan sees every conversation.
+function findOlderProjectOnRescan() {
+  const notes = candidate("/scratch/notes", { git: null });
+  appAtomRegistry.set(candidatesAtom(), [
+    candidate("/projects/first"),
+    candidate("/projects/second"),
+    notes,
+  ]);
+  state.olderProjectCount = 1;
+  state.refreshScan.mockImplementation(() => appAtomRegistry.set(scanRefreshingAtom(), true));
+  return () =>
+    act(async () => {
+      state.olderProjectCount = undefined;
+      appAtomRegistry.set(candidatesAtom(), [
+        candidate("/projects/first"),
+        candidate("/projects/second"),
+        notes,
+        candidate("/projects/archive", {
+          lastActiveAt: new Date(NOW - 400 * 86_400_000).toISOString(),
+        }),
+      ]);
+      appAtomRegistry.set(scanRefreshingAtom(), false);
+    });
+}
+
+async function turnOnAllHistory() {
+  await click("Last 30 days");
+  const allHistory = page.getByRole("switch", { name: "All history" });
+  await expect.element(allHistory).toBeVisible();
+  await act(async () => (allHistory.element() as HTMLElement).click());
+}
+
+function listedCheckboxes() {
+  return [...document.querySelectorAll<HTMLElement>('fieldset [role="checkbox"]')];
+}
+
+it("turning on All history saves it on this computer, rescans once saved, and checks every project the rescan finds", async () => {
+  using _now = setup();
+  grantSettingsWrite();
+  appAtomRegistry.set(configAtom(), serverConfig());
+  appAtomRegistry.set(providersAtom(), []);
+  const finishRescan = findOlderProjectOnRescan();
+  const saved = deferred<void>();
+  state.updateSettings.mockImplementationOnce(async (input: UpdateSettingsInput) => {
+    await saved.promise;
+    return saveImportLimits(input);
+  });
+  await using _screen = await mountWelcome();
+
+  await click("Review all 3");
+  expect(pageText()).toContain("2 of 3 selected");
+  await turnOnAllHistory();
+  expect(state.updateSettings).toHaveBeenCalledExactlyOnceWith({
+    environmentId: primaryId,
+    input: { patch: { agentSessionImport: { windowDays: null } } },
+  });
+  expect(button("Start without an agent").disabled).toBe(true);
+  expect(state.refreshScan).not.toHaveBeenCalled();
+
+  await act(async () => {
+    saved.resolve();
+    await saved.promise;
+  });
+  await vi.waitFor(() => expect(state.refreshScan).toHaveBeenCalledOnce());
+  expect(pageText()).toContain("Checking projects…");
+  expect(button("Start without an agent").disabled).toBe(true);
+  // An agent finishing its sign-in during the rescan still waits for it.
+  await act(async () => appAtomRegistry.set(providersAtom(), [readyClaude]));
+  expect(button("Import 3 projects and start").disabled).toBe(true);
+
+  await finishRescan();
+  await vi.waitFor(() => expect(pageText()).toContain("4 of 4 selected"));
+  expect(pageText()).toContain("Other folders");
+  expect(
+    listedCheckboxes().every((checkbox) => checkbox.getAttribute("aria-checked") === "true"),
+  ).toBe(true);
+  await click("Import 4 projects and start");
+  await vi.waitFor(() => expect(state.onDone).toHaveBeenCalledOnce());
+  expect(
+    appAtomRegistry
+      .get(projectsAtom())
+      .map((project) => project.workspaceRoot)
+      .toSorted(),
+  ).toEqual(["/projects/archive", "/projects/first", "/projects/second", "/scratch/notes"]);
+});
+
+it("unchecking the import box while All history saves keeps the selection empty", async () => {
+  using _now = setup();
+  grantSettingsWrite();
+  appAtomRegistry.set(configAtom(), serverConfig());
+  const finishRescan = findOlderProjectOnRescan();
+  const saved = deferred<void>();
+  state.updateSettings.mockImplementationOnce(async (input: UpdateSettingsInput) => {
+    await saved.promise;
+    return saveImportLimits(input);
+  });
+  await using _screen = await mountWelcome();
+
+  await click("Review all 3");
+  await turnOnAllHistory();
+  const importProjects = document.querySelector<HTMLElement>('[role="checkbox"]');
+  await act(async () => importProjects?.click());
+  expect(pageText()).toContain("0 of 3 selected");
+  await act(async () => {
+    saved.resolve();
+    await saved.promise;
+  });
+  await vi.waitFor(() => expect(state.refreshScan).toHaveBeenCalledOnce());
+
+  await finishRescan();
+  await vi.waitFor(() => expect(pageText()).toContain("0 of 4 selected"));
+  expect(
+    listedCheckboxes().some((checkbox) => checkbox.getAttribute("aria-checked") === "true"),
+  ).toBe(false);
+  expect(button("Start").disabled).toBe(false);
+});
+
+it("offers the time window when every project found has only older conversations", async () => {
+  using _now = setup();
+  grantSettingsWrite();
+  appAtomRegistry.set(configAtom(), serverConfig());
+  appAtomRegistry.set(candidatesAtom(), []);
+  state.olderProjectCount = 2;
+  state.refreshScan.mockImplementation(() => appAtomRegistry.set(scanRefreshingAtom(), true));
+  await using _screen = await mountWelcome();
+
+  await vi.waitFor(() => expect(pageText()).toContain("2 projects have only older conversations."));
+  expect(pageText()).not.toContain("Import projects and their threads");
+  await turnOnAllHistory();
+  await vi.waitFor(() => expect(state.refreshScan).toHaveBeenCalledOnce());
+  await act(async () => {
+    state.olderProjectCount = undefined;
+    const older = { lastActiveAt: new Date(NOW - 90 * 86_400_000).toISOString() };
+    appAtomRegistry.set(candidatesAtom(), [
+      candidate("/projects/first", older),
+      candidate("/projects/second", older),
+    ]);
+    appAtomRegistry.set(scanRefreshingAtom(), false);
+  });
+
+  await vi.waitFor(() => expect(pageText()).toContain("Import 2 projects and their threads"));
+  await click("Import 2 projects and start");
+  await vi.waitFor(() => expect(state.onDone).toHaveBeenCalledOnce());
+  expect(
+    appAtomRegistry
+      .get(projectsAtom())
+      .map((project) => project.workspaceRoot)
+      .toSorted(),
+  ).toEqual(["/projects/first", "/projects/second"]);
+});
+
+it("keeps import limits read-only without settings permission, locks managed rows, and hides them without the capability", async () => {
+  using _now = setup();
+  appAtomRegistry.set(configAtom(), {
+    ...serverConfig(),
+    environment: { capabilities: {} },
+  });
+  // Servers that list permissions grant only those, so operating does not imply settings writes.
+  appAtomRegistry.set(
+    sessionAtom(primaryId),
+    AsyncResult.success({
+      ...session([AuthOrchestrationOperateScope]),
+      permissions: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+    }),
+  );
+  await using _screen = await mountWelcome();
+
+  await click("Review all 2");
+  expect(pageText()).toContain("2 of 2 selected");
+  expect(pageText()).not.toContain("Last 30 days");
+
+  await act(async () =>
+    appAtomRegistry.set(
+      configAtom(),
+      serverConfig(
+        { windowDays: 365, messagesPerThread: null },
+        {
+          managedPolicy: {
+            organization: "Example Corp",
+            lockedSettings: ["agentSessionImport.windowDays"],
+          },
+        },
+      ),
+    ),
+  );
+  await click("Last 365 days");
+  const allHistory = page.getByRole("switch", { name: "All history" });
+  const fullHistory = page.getByRole("switch", { name: "Full history" });
+  await expect.element(allHistory).toHaveAttribute("aria-disabled", "true");
+  await expect.element(fullHistory).toHaveAttribute("aria-disabled", "true");
+  await expect.element(page.getByLabelText("Scan budget in MiB")).toBeDisabled();
+  expect(pageText()).toContain("This connection cannot change import settings.");
+  expect(pageText()).not.toContain("Reset to defaults");
+
+  await act(async () => grantSettingsWrite());
+  await expect.element(fullHistory).not.toHaveAttribute("aria-disabled", "true");
+  await expect.element(allHistory).toHaveAttribute("aria-disabled", "true");
+  await expect.element(allHistory).toHaveAccessibleDescription(/Managed by Example Corp\./);
+  await expect.element(page.getByLabelText("Time window in days")).toBeDisabled();
+  await expect.element(page.getByLabelText("Scan budget in MiB")).toBeEnabled();
+  expect(pageText()).not.toContain("This connection cannot change import settings.");
+  await click("Reset to defaults");
+  expect(state.updateSettings).toHaveBeenCalledExactlyOnceWith({
+    environmentId: primaryId,
+    input: { patch: { agentSessionImport: { messagesPerThread: 200 } } },
+  });
+  expect(state.refreshScan).not.toHaveBeenCalled();
 });
 
 it("says the phone is set up only once this computer is shared with the signed-in account", async () => {

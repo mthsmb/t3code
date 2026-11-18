@@ -38,7 +38,14 @@ import {
   TerminalIcon,
 } from "lucide-react";
 import { msg, T, useGT, useLocale, useMessages, Var } from "gt-react";
-import { useEffect, useEffectEvent, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useEffectEvent,
+  useRef,
+  useState,
+  type ReactNode,
+  type SetStateAction,
+} from "react";
 
 import { TYPOGRAPHY_ADVANCED_STORAGE_KEY } from "../../appearanceFonts";
 import { MOBILE_APP_URL } from "../../branding";
@@ -57,9 +64,11 @@ import {
   partitionOnboardingProjects,
   onboardingProjectKey,
   projectImportWarning,
+  resolveImportSelection,
   resolveOnboardingLandingProject,
   isNewOnboardingProject,
   resolveOnboardingProjectId,
+  selectEveryProjectFound,
   type OnboardingProjectGroup,
   splitOnboardingProjectPath,
 } from "../../onboarding/projectImport.logic";
@@ -115,6 +124,11 @@ import { ScrollArea } from "../ui/scroll-area";
 import { SidebarInset } from "../ui/sidebar";
 import { toastManager } from "../ui/toast";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
+import {
+  useWelcomeImportOptions,
+  WelcomeImportOptions,
+  type WelcomeImportOptionsState,
+} from "./WelcomeImportOptions";
 import { cn } from "../../lib/utils";
 import { formatRelativeTime } from "../../timestampFormat";
 
@@ -159,7 +173,7 @@ export function WelcomePage({
   );
   // The page keeps its own copy, so a failed write (a full quota) cannot undo a choice.
   const [importSelection, setImportSelectionState] = useState(storedSelection);
-  const setImportSelection = (next: WelcomeImportSelection | null) => {
+  const setImportSelection = (next: SetStateAction<WelcomeImportSelection | null>) => {
     setImportSelectionState(next);
     storeSelection(next);
   };
@@ -255,6 +269,9 @@ export function WelcomePage({
     holdPageRef,
     onDone: finish,
   });
+  const importOptions = useWelcomeImportOptions(environmentId, scans[0], (patch) => {
+    if (patch.windowDays === null) projectImport.selectEveryProjectFound();
+  });
   // Without import permission, starting simply skips the projects.
   const selected = projectImport.canWrite ? projectImport.selected : [];
   const newCount = selected.filter(projectImport.isNew).length;
@@ -302,6 +319,7 @@ export function WelcomePage({
               <ProjectsSection
                 scan={scans[0]}
                 projectImport={projectImport}
+                importOptions={importOptions}
                 isImporting={isImporting}
               />
               {showPhone ? <PhoneSection environmentId={environmentId} /> : null}
@@ -310,7 +328,11 @@ export function WelcomePage({
               {agentReady ? (
                 <span />
               ) : (
-                <Button variant="ghost-muted" disabled={isImporting} onClick={start}>
+                <Button
+                  variant="ghost-muted"
+                  disabled={isImporting || importOptions.blocksStart}
+                  onClick={start}
+                >
                   <T>Start without an agent</T>
                 </Button>
               )}
@@ -320,7 +342,10 @@ export function WelcomePage({
                     <T>Set up one agent to start.</T>
                   </span>
                 )}
-                <Button disabled={!agentReady || isImporting} onClick={start}>
+                <Button
+                  disabled={!agentReady || isImporting || importOptions.blocksStart}
+                  onClick={start}
+                >
                   {isImporting
                     ? selected.length > 0
                       ? gt("Importing…")
@@ -799,10 +824,12 @@ function AgentLogoStack({
 function ProjectsSection({
   scan,
   projectImport,
+  importOptions,
   isImporting,
 }: {
   readonly scan: ReturnType<typeof useProjectScans>[number] | undefined;
   readonly projectImport: ReturnType<typeof useProjectImport>;
+  readonly importOptions: WelcomeImportOptionsState;
   readonly isImporting: boolean;
 }) {
   const gt = useGT();
@@ -813,6 +840,7 @@ function ProjectsSection({
     canWrite,
     candidates,
     isNew,
+    olderCount,
     recent,
     selected,
     selectedKeys,
@@ -846,6 +874,26 @@ function ProjectsSection({
           <span>{gt("Could not check projects. {error}", { error: scan.error })}</span>
           {retry}
         </div>
+      </WelcomeSection>
+    );
+  }
+  if (candidates.length === 0 && canWrite && importOptions.supported && olderCount > 0) {
+    return (
+      <WelcomeSection title={gt("Projects")}>
+        <div className="flex min-h-10 items-center justify-between gap-3">
+          <p className="text-sm text-muted-foreground">
+            {gt(
+              "{count, plural, one {{count} project has only older conversations.} other {{count} projects have only older conversations.}}",
+              { count: olderCount },
+            )}
+          </p>
+          <WelcomeImportOptions options={importOptions} />
+        </div>
+        {scan.data?.truncated ? (
+          <p className="text-xs text-muted-foreground" role="status">
+            {m(SCAN_LIMIT_MESSAGE)}
+          </p>
+        ) : null}
       </WelcomeSection>
     );
   }
@@ -920,15 +968,18 @@ function ProjectsSection({
         <fieldset className="-mx-1.5 mt-1 min-w-0" disabled={isImporting}>
           <div className="flex items-center justify-between gap-3 px-2 text-xs text-muted-foreground">
             <span role="status">
-              {gt(
-                "{selected, plural, one {{selected} of {total} selected} other {{selected} of {total} selected}}",
-                {
-                  selected: selected.length,
-                  total: candidates.length,
-                },
-              )}
+              {scan.isPending
+                ? gt("Checking projects…")
+                : gt(
+                    "{selected, plural, one {{selected} of {total} selected} other {{selected} of {total} selected}}",
+                    {
+                      selected: selected.length,
+                      total: candidates.length,
+                    },
+                  )}
             </span>
             <div className="flex items-center gap-1">
+              {importOptions.supported ? <WelcomeImportOptions options={importOptions} /> : null}
               <Button
                 variant="ghost"
                 size="xs"
@@ -1485,7 +1536,7 @@ function useProjectImport({
 }: {
   readonly scans: ReturnType<typeof useProjectScans>;
   readonly importSelection: WelcomeImportSelection | null;
-  readonly onImportSelectionChange: (next: WelcomeImportSelection) => void;
+  readonly onImportSelectionChange: (next: SetStateAction<WelcomeImportSelection | null>) => void;
   readonly isImporting: boolean;
   readonly setIsImporting: (value: boolean) => void;
   // Blocks leaving the page; onDone releases it before landing.
@@ -1534,15 +1585,7 @@ function useProjectImport({
   const isNew = (candidate: ImportCandidate) => isNewProject(candidate.environmentId, candidate);
   const recent = recentActive.filter(isNew);
   const recentKeys = new Set(recent.map((candidate) => candidate.key));
-  const knownKeys = new Set(importSelection?.knownKeys);
-  const pickedKeys = new Set(importSelection?.keys);
-  const selected = importSelection?.optedOut
-    ? []
-    : candidates.filter((candidate) =>
-        knownKeys.has(candidate.key)
-          ? pickedKeys.has(candidate.key)
-          : recentKeys.has(candidate.key),
-      );
+  const selected = resolveImportSelection(importSelection, candidates, recentKeys);
   const selectedKeys = new Set(selected.map((candidate) => candidate.key));
   const setSelectedKeys = (keys: ReadonlySet<string>, { optedOut = false } = {}) =>
     onImportSelectionChange({
@@ -1550,7 +1593,10 @@ function useProjectImport({
       keys: [...keys],
       optedOut,
     });
+  const selectEveryFound = () =>
+    onImportSelectionChange((current) => selectEveryProjectFound(current, candidates, recentKeys));
 
+  const olderCount = scans.reduce((total, scan) => total + (scan.data?.olderProjectCount ?? 0), 0);
   const canWrite = scans.every((scan) => writableEnvironments.has(scan.environmentId));
   const canImport = selected.every((candidate) =>
     writableEnvironments.has(candidate.environmentId),
@@ -1728,10 +1774,12 @@ function useProjectImport({
     canWrite,
     candidates,
     isNew,
+    olderCount,
     recent,
     selected,
     selectedKeys,
     setSelectedKeys,
+    selectEveryProjectFound: selectEveryFound,
     visibleImportError,
     runImport,
     finishAfterImport,

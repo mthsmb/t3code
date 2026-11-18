@@ -6,6 +6,7 @@ import type { AgentSessionProjectCandidate, EnvironmentId, ProjectId } from "@t3
 import { msg } from "gt-react";
 
 import { m, type MessageResolver } from "../i18n/messages";
+import type { WelcomeImportSelection } from "./welcomeState";
 
 const RECENT_PROJECT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_SELECTION_MIN_THREADS = 3;
@@ -147,6 +148,35 @@ export function resolveOnboardingLandingProject<T>(
     if (project !== undefined) return project;
   }
   return undefined;
+}
+
+/** Projects found after the last choice get the default pick, or every one after All history. */
+export function resolveImportSelection<T extends { readonly key: string }>(
+  selection: WelcomeImportSelection | null,
+  candidates: ReadonlyArray<T>,
+  recentKeys: ReadonlySet<string>,
+): ReadonlyArray<T> {
+  if (selection?.optedOut) return [];
+  const knownKeys = new Set(selection?.knownKeys);
+  const pickedKeys = new Set(selection?.keys);
+  return candidates.filter((candidate) =>
+    knownKeys.has(candidate.key)
+      ? pickedKeys.has(candidate.key)
+      : selection?.selectsFound === true || recentKeys.has(candidate.key),
+  );
+}
+
+/** An opt-out or an emptied list wins over All history, so it never checks what was unchecked. */
+export function selectEveryProjectFound(
+  current: WelcomeImportSelection | null,
+  candidates: ReadonlyArray<{ readonly key: string }>,
+  recentKeys: ReadonlySet<string>,
+): WelcomeImportSelection | null {
+  if (current?.optedOut) return current;
+  if (candidates.length > 0 && resolveImportSelection(current, candidates, recentKeys).length === 0)
+    return current;
+  const keys = candidates.map((candidate) => candidate.key);
+  return { knownKeys: keys, keys, optedOut: false, selectsFound: true };
 }
 
 /**

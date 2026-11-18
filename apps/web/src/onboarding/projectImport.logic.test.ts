@@ -7,8 +7,10 @@ import {
   partitionOnboardingProjects,
   onboardingProjectKey,
   projectImportWarning,
+  resolveImportSelection,
   resolveOnboardingLandingProject,
   resolveOnboardingProjectId,
+  selectEveryProjectFound,
 } from "./projectImport.logic";
 
 const now = Date.parse("2026-08-22T12:00:00.000Z");
@@ -264,6 +266,35 @@ describe("projectImportWarning", () => {
     },
   ])("separates deferred threads from failures: $warning", ({ totals, warning }) => {
     expect(projectImportWarning(totals)).toBe(warning);
+  });
+});
+
+describe("welcome import selection", () => {
+  const listed = [{ key: "repo" }, { key: "clone" }, { key: "folder" }];
+  const recentKeys = new Set(["repo"]);
+
+  it("All history checks every project found while the import box is on", () => {
+    const everyListed = selectEveryProjectFound(null, listed, recentKeys);
+    expect(everyListed).toEqual({
+      knownKeys: ["repo", "clone", "folder"],
+      keys: ["repo", "clone", "folder"],
+      optedOut: false,
+      selectsFound: true,
+    });
+    const rescanned = [...listed, { key: "archive" }];
+    expect(resolveImportSelection(everyListed, rescanned, recentKeys)).toEqual(rescanned);
+
+    const onlyOlder = selectEveryProjectFound(null, [], new Set());
+    expect(onlyOlder).toEqual({ knownKeys: [], keys: [], optedOut: false, selectsFound: true });
+    expect(resolveImportSelection(onlyOlder, listed, new Set())).toEqual(listed);
+  });
+
+  it("All history leaves an opted-out or emptied selection alone", () => {
+    const optedOut = { knownKeys: [], keys: [], optedOut: true };
+    const emptied = { knownKeys: ["repo", "clone", "folder"], keys: [], optedOut: false };
+
+    expect(selectEveryProjectFound(optedOut, listed, recentKeys)).toBe(optedOut);
+    expect(selectEveryProjectFound(emptied, listed, recentKeys)).toBe(emptied);
   });
 });
 

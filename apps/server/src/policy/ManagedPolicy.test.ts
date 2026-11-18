@@ -147,6 +147,11 @@ it.layer(NodeServices.layer)("ManagedPolicy.load", (it) => {
             ...base,
             settings: { "observability.otlpTracesUrl": { value: "", locked: true } },
           }),
+          // Reading the settings would quietly replace the locked value with the default.
+          JSON.stringify({
+            ...base,
+            settings: { "agentSessionImport.windowDays": { value: 0, locked: true } },
+          }),
         ],
         (contents) =>
           loadFrom(contents).pipe(
@@ -154,7 +159,7 @@ it.layer(NodeServices.layer)("ManagedPolicy.load", (it) => {
             Effect.map((error) => error.reason),
           ),
       );
-      assert.lengthOf(reasons, 14);
+      assert.lengthOf(reasons, 15);
       assert.include(reasons[3], "storageCleanup.logsAfterDayz");
       assert.include(reasons[6], "adds entries users could not remove");
       assert.include(reasons[7], "adds entries users could not remove");
@@ -164,6 +169,7 @@ it.layer(NodeServices.layer)("ManagedPolicy.load", (it) => {
       assert.include(reasons[11], 'lock "providerInstances.codex" as a whole');
       assert.include(reasons[12], "holds a credential");
       assert.include(reasons[13], "a policy cannot override");
+      assert.include(reasons[14], "its value is invalid");
     }),
   );
 

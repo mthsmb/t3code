@@ -64,8 +64,8 @@ app with a code from **Settings → Sharing & access**.
 
 ## Projects
 
-T3 Code finds directories that Claude Code, Codex or Pi has used in the last 30
-days. Git repositories are listed first, newest activity on top. When the remote
+T3 Code finds directories that Claude Code, Codex or Pi has used within the
+import time window, the last 30 days by default. Git repositories are listed first, newest activity on top. When the remote
 is on GitHub, the group shows the repository as `owner/name`. Clones with the
 same remote share one group. Directories that are not git repositories sit under
 "Other folders".
@@ -83,8 +83,17 @@ anything under `Downloads` are not offered.
 A large or malformed history can reach the scan limit. T3 Code keeps the
 projects it found and warns when projects or conversations may be missing.
 
-Imported projects include Claude, Codex and Pi conversations active within the last
-30 days. You can continue those conversations in T3 Code. Pi is off by default:
+To import older history, select **Review all**, then the button labelled with the
+time window, such as **Last 30 days**. Turn on **All history** to import
+conversations of any age, and **Full history** to keep every message of each
+conversation. Changing the time window or the scan budget checks your projects
+again, and **Start** waits for that check. While the import box is checked,
+turning on **All history** checks every project the new check finds, including
+those under "Other folders". When every project found has only older
+conversations, the page says how many and shows the same button.
+
+Imported projects include Claude, Codex and Pi conversations active within the
+time window. You can continue those conversations in T3 Code. Pi is off by default:
 open **Add more agents** and select **Turn on** next to Pi, and the page looks for
 its sessions too. Pi sessions
 are read from each enabled Pi provider's session directory, which follows
@@ -92,7 +101,7 @@ are read from each enabled Pi provider's session directory, which follows
 Pi conversation imports its active branch, the one Pi reopens.
 
 Conversation import is best effort. T3 Code keeps the first user prompt and the
-newest remaining visible user and assistant messages, with 200 messages total.
+newest remaining visible user and assistant messages, up to 200 by default.
 It omits tool activity and attachments. For Codex, it omits generated setup
 context only when a canonical user event and a valid shared turn ID identify the
 same user turn. Ambiguous legacy or response-only context stays in the imported
@@ -102,12 +111,12 @@ notifications and interruption markers are left out, and a conversation that
 only ran commands such as `/clear`, with no reply, is skipped. It reads one
 conversation at a time and skips files larger than 4 GiB. It also skips a conversation when the
 message text and metadata it keeps need more than 32 MiB of memory. Tool output
-does not count toward that limit. It skips a conversation with more than 100,000
-records every time, so opening the page again does not import it. It ignores
+does not count toward that limit. It skips a Codex or Pi conversation with more
+than 100,000 records every time, so opening the page again does not import it. It ignores
 malformed records and conversations with no messages, such as a session opened
 in an editor but never used. It skips unreadable or unparseable conversations.
 
-Each import attempt reads up to 100 conversations and 4 GiB per project.
+Each import attempt reads up to 100 conversations and 4 GiB per project by default.
 Conversations with no messages count toward the 4 GiB but not the 100. The
 summary counts the conversations past that limit as not imported yet, separately
 from conversations that could not be imported. To continue a large batch, open
@@ -118,3 +127,23 @@ without the remaining history.
 You can start without importing. While an import runs, T3 Code stays on the
 Welcome page. If you quit, open the Welcome page again from **Settings → About**; the
 projects you started stay checked.
+
+### Import limits
+
+To change the import limits, go to **Settings → Threads → Session import**, or
+use the time window button on the Welcome page. They apply to the computer you
+are setting up, to conversations that are not imported yet.
+
+| Limit                    | Default | Range                               |
+| ------------------------ | ------- | ----------------------------------- |
+| Time window              | 30 days | 1 to 3,650 days, or **All history** |
+| Messages per thread      | 200     | 2 to 10,000, or **Full history**    |
+| Conversations per run    | 100     | 1 to 5,000                          |
+| Records per conversation | 100,000 | 1,000 to 1,000,000                  |
+| Scan budget              | 64 MiB  | 1 to 1,024 MiB                      |
+
+The records limit applies to Codex and Pi conversations. Raise the scan budget
+when projects are missing. Higher limits make imports slower and use more
+memory, and a conversation still needs to fit in 32 MiB. An organization can
+lock a limit with a [managed policy](./managed-policy.md); a locked limit says
+who manages it and cannot be changed.
