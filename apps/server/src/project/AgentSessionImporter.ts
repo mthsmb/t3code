@@ -101,6 +101,13 @@ export function isNativeHistoryPending(input: {
   return input.historyOrigin !== "v1_import" && !input.hasRun;
 }
 
+/**
+ * T3's Antigravity runtime keeps its conversations in a private per-instance profile, so it cannot
+ * load one from the user's own Antigravity home. An imported conversation binds no native thread,
+ * and its first turn starts a fresh session with the imported history.
+ */
+const bindsNativeThread = (source: AgentSessionSource): boolean => source !== "antigravity";
+
 function dateTime(value: string): DateTime.Utc {
   return DateTime.makeUnsafe(value);
 }
@@ -303,6 +310,7 @@ const make = Effect.gen(function* () {
           // Pi resumes by session file path; its session UUID only names the thread.
           const nativeThreadId =
             thread.source === "pi" ? source.filePath : thread.providerSessionId;
+          const bindsNative = bindsNativeThread(thread.source);
           const persistRuntime = runtimes.upsert(
             {
               threadId,
@@ -312,8 +320,9 @@ const make = Effect.gen(function* () {
               runtimeMode,
               status: "stopped",
               lastSeenAt: thread.updatedAt,
-              resumeCursor:
-                thread.source === "claudeAgent"
+              resumeCursor: !bindsNative
+                ? null
+                : thread.source === "claudeAgent"
                   ? { threadId, resume: thread.providerSessionId }
                   : { threadId: nativeThreadId },
               runtimePayload: { cwd: outcome.worktree?.path ?? project.workspaceRoot },
@@ -375,7 +384,7 @@ const make = Effect.gen(function* () {
             worktreePath: outcome.worktree?.path ?? null,
             linkedPullRequest: null,
             branchPullRequest: null,
-            activeProviderThreadId: providerThreadId,
+            activeProviderThreadId: bindsNative ? providerThreadId : null,
             historyOrigin: "v1_import",
             lineage: {
               parentThreadId: null,
@@ -462,15 +471,21 @@ const make = Effect.gen(function* () {
               ...thread.messages.flatMap((message, index) =>
                 messageEvents({ threadId, index, message }),
               ),
-              {
-                id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`),
-                type: "provider-thread.updated",
-                threadId,
-                driver,
-                providerInstanceId: thread.providerInstanceId,
-                occurredAt: updatedAt,
-                payload: providerThread,
-              },
+              ...(bindsNative
+                ? [
+                    {
+                      id: EventId.make(
+                        `${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`,
+                      ),
+                      type: "provider-thread.updated" as const,
+                      threadId,
+                      driver,
+                      providerInstanceId: thread.providerInstanceId,
+                      occurredAt: updatedAt,
+                      payload: providerThread,
+                    },
+                  ]
+                : []),
             ],
           });
           if (committed.length === 0) return null;

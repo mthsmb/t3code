@@ -45,6 +45,12 @@ import { piHome, resolvePiSessionsDir } from "@t3tools/provider-pi/server/usage"
 import * as ServerSettings from "../serverSettings.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import {
+  antigravityConversationDirectories,
+  readAntigravityConversationCwd,
+  readAntigravityTranscript,
+  type AntigravityTranscript,
+} from "./AntigravityConversations.ts";
+import {
   createTranscriptJsonReader,
   createTranscriptJsonSelector,
   TranscriptJsonLimitError,
@@ -190,6 +196,9 @@ const CODEX_STATE_DATABASE = "state_5.sqlite";
 const decodeCodexSessionIndexEntry = Schema.decodeUnknownOption(
   Schema.fromJsonString(CodexSessionIndexEntry),
 );
+/** Antigravity names each conversation database by its UUID; older IDE `.pb` files are encrypted. */
+const ANTIGRAVITY_CONVERSATION_FILE_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.db$/i;
 
 type DecodedTranscriptRecord = typeof TranscriptRecord.Type;
 
@@ -463,6 +472,44 @@ export function parseAgentSessionTranscript(
       : emptyClaudeFields;
   const thread = parseAgentSessionRecords(input, records, claudeFields, 0);
   return thread === "empty" ? null : thread;
+}
+
+/**
+ * Keeps the first user message and the newest history, like transcripts. A step without a time
+ * takes the previous step's, which is closer than the file's modification time.
+ */
+export function parseAntigravityTranscript(
+  input: AgentSessionTranscriptMetadata,
+  transcript: Pick<AntigravityTranscript, "messages" | "createdAtMs" | "omittedMessageCount">,
+): AgentSessionThread | "empty" | null {
+  if (transcript.messages.length === 0 && transcript.omittedMessageCount === 0) return "empty";
+  const updatedAt = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
+  let atMs = transcript.createdAtMs ?? input.lastActiveAtMs;
+  const messages = transcript.messages.map((message): AgentSessionThreadMessage => {
+    atMs = message.createdAtMs ?? atMs;
+    return {
+      role: message.role,
+      text: message.text,
+      createdAt: DateTime.formatIso(DateTime.makeUnsafe(atMs)),
+    };
+  });
+  const firstUserMessage = messages.find((message) => message.role === "user");
+  if (firstUserMessage === undefined) return null;
+  const newest = messages.slice(-MAX_IMPORTED_MESSAGES);
+  const retainedMessages = newest.includes(firstUserMessage)
+    ? newest
+    : [firstUserMessage, ...messages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
+  return {
+    source: input.source,
+    providerInstanceId: input.providerInstanceId,
+    providerSessionId: input.fallbackSessionId,
+    title: deriveTitle(input.source, firstUserMessage.text) ?? "Imported thread",
+    model: null,
+    createdAt: retainedMessages[0]?.createdAt ?? updatedAt,
+    updatedAt,
+    messages: retainedMessages,
+    omittedMessageCount: messages.length - retainedMessages.length + transcript.omittedMessageCount,
+  };
 }
 
 function parseAgentSessionRecords(
@@ -883,6 +930,12 @@ export const make = Effect.gen(function* () {
   const statOption = (target: string) =>
     fileSystem.stat(target).pipe(Effect.asSome, Effect.orElseSucceed(Option.none));
 
+  const provideFiles = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path>) =>
+    effect.pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+    );
+
   const transcriptChunkReader = Effect.fn("AgentSessionScanner.transcriptChunkReader")(function* (
     file: FileSystem.File,
     filePath: string,
@@ -1134,6 +1187,28 @@ export const make = Effect.gen(function* () {
     budget: MetadataReadBudget,
   ) {
     if (transcript.identity.size === 0) return null;
+    if (source === "antigravity") {
+      if (
+        budget.bytesRemaining === 0 ||
+        budget.operationsRemaining === 0 ||
+        budget.recordsRemaining === 0
+      ) {
+        budget.truncated = true;
+        return null;
+      }
+      budget.operationsRemaining -= 1;
+      budget.recordsRemaining -= 1;
+      const { cwd, bytesRead } = yield* provideFiles(
+        readAntigravityConversationCwd(transcript.filePath),
+      );
+      if (bytesRead > budget.bytesRemaining) {
+        budget.bytesRemaining = 0;
+        budget.truncated = true;
+        return null;
+      }
+      budget.bytesRemaining -= bytesRead;
+      return cwd;
+    }
     if (
       budget.bytesRemaining === 0 ||
       budget.operationsRemaining < 2 ||
@@ -1348,6 +1423,31 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
+  });
+
+  /** A database that changed while it was read is skipped, like a transcript that grew. */
+  const readAntigravityThread = Effect.fn("AgentSessionScanner.readAntigravityThread")(function* (
+    expected: ReturnType<typeof transcriptIdentity>,
+    input: AgentSessionTranscriptMetadata,
+  ) {
+    const transcript = yield* provideFiles(
+      readAntigravityTranscript(expected.filePath, {
+        maxMessages: MAX_IMPORTED_MESSAGES,
+        maxHistoryBytes: MAX_IMPORT_HISTORY_BYTES,
+      }),
+    );
+    if (transcript === null) return null;
+    const after = yield* statOption(expected.filePath);
+    if (
+      Option.isNone(after) ||
+      !sameTranscriptIdentity(expected, transcriptIdentity(expected.filePath, after.value))
+    ) {
+      return null;
+    }
+    return {
+      cwd: Option.fromNullOr(transcript.cwd),
+      thread: parseAntigravityTranscript(input, transcript),
+    };
   });
 
   const readCodexThreadNames = Effect.fn("AgentSessionScanner.readCodexThreadNames")(function* (
@@ -1640,6 +1740,59 @@ export const make = Effect.gen(function* () {
     return { transcripts, truncated, operationsUsed: operationBudget - operationsRemaining };
   });
 
+  /**
+   * New steps sit in a live WAL until a checkpoint, so a non-empty WAL can be newer than its
+   * database.
+   */
+  const discoverAntigravityTranscripts = Effect.fn(
+    "AgentSessionScanner.discoverAntigravityTranscripts",
+  )(function* (
+    conversationsDir: string,
+    providerInstanceId: ProviderInstanceId,
+    operationBudget: number,
+  ) {
+    const transcripts: Array<TranscriptCandidate> = [];
+    if (operationBudget <= 0) return { transcripts, truncated: true, operationsUsed: 0 };
+    let operationsRemaining = operationBudget - 1;
+    let truncated = false;
+    const entries = new Set(yield* listDirectory(conversationsDir));
+    for (const entry of [...entries]
+      .filter((name) => ANTIGRAVITY_CONVERSATION_FILE_PATTERN.test(name))
+      .toSorted()) {
+      if (operationsRemaining <= 0) {
+        truncated = true;
+        break;
+      }
+      operationsRemaining -= 1;
+      const filePath = path.join(conversationsDir, entry);
+      const stats = yield* statOption(filePath);
+      if (
+        Option.isNone(stats) ||
+        stats.value.type !== "File" ||
+        Option.isNone(stats.value.mtime) ||
+        Number(stats.value.size) === 0
+      ) {
+        continue;
+      }
+      let mtimeMs = stats.value.mtime.value.getTime();
+      if (entries.has(`${entry}-wal`) && operationsRemaining > 0) {
+        operationsRemaining -= 1;
+        const wal = yield* statOption(`${filePath}-wal`);
+        if (Option.isSome(wal) && Number(wal.value.size) > 0 && Option.isSome(wal.value.mtime)) {
+          mtimeMs = Math.max(mtimeMs, wal.value.mtime.value.getTime());
+        }
+      }
+      transcripts.push({
+        filePath,
+        mtimeMs,
+        providerInstanceId,
+        homePath: conversationsDir,
+        identity: transcriptIdentity(filePath, stats.value),
+      });
+    }
+    return { transcripts, truncated, operationsUsed: operationBudget - operationsRemaining };
+  });
+
   const groupTranscriptsByCwd = Effect.fn("AgentSessionScanner.groupTranscriptsByCwd")(function* (
     source: AgentSessionSource,
     transcripts: ReadonlyArray<TranscriptCandidate>,
@@ -1727,7 +1880,7 @@ export const make = Effect.gen(function* () {
     let truncated = false;
     let metadataTruncated = false;
 
-    for (const source of ["claudeAgent", "codex", "pi"] as const) {
+    for (const source of ["claudeAgent", "codex", "pi", "antigravity"] as const) {
       const instances: Array<{
         readonly instanceId: ProviderInstanceId;
         readonly config: ProviderInstanceConfig;
@@ -1764,24 +1917,27 @@ export const make = Effect.gen(function* () {
           return typeof configured === "string" ? configured : hostEnvironment[name];
         };
 
-        let homePath: string;
-        if (source === "pi") {
-          const environment = yield* mergeProviderInstanceEnvironment(
-            instance.environment,
-            hostEnvironment,
-          ).pipe(Effect.provideService(HostProcess.HomeDirectory, homeDir));
-          homePath = resolvePiSessionsDir(
-            environment,
-            piHome(environment, homeDir, platform),
-            path,
+        const instanceEnvironment = mergeProviderInstanceEnvironment(
+          instance.environment,
+          hostEnvironment,
+        ).pipe(Effect.provideService(HostProcess.HomeDirectory, homeDir));
+
+        let homePaths: ReadonlyArray<string>;
+        if (source === "antigravity") {
+          homePaths = yield* provideFiles(
+            antigravityConversationDirectories(yield* instanceEnvironment, homeDir, platform),
           );
+        } else if (source === "pi") {
+          const environment = yield* instanceEnvironment;
+          homePaths = [
+            resolvePiSessionsDir(environment, piHome(environment, homeDir, platform), path),
+          ];
         } else if (source === "claudeAgent") {
           const config = decodeClaudeSettings(instance.config ?? {});
           if (Option.isNone(config)) continue;
-          homePath = resolveClaudeConfigDir(
-            config.value.homePath,
-            environmentHome("CLAUDE_CONFIG_DIR"),
-          );
+          homePaths = [
+            resolveClaudeConfigDir(config.value.homePath, environmentHome("CLAUDE_CONFIG_DIR")),
+          ];
         } else {
           const config = decodeCodexSettings(instance.config ?? {});
           if (Option.isNone(config)) continue;
@@ -1795,13 +1951,15 @@ export const make = Effect.gen(function* () {
           const layout = yield* resolveCodexHomeLayout(codexSettings).pipe(
             Effect.provideService(Path.Path, path),
           );
-          homePath = layout.sharedHomePath;
+          homePaths = [layout.sharedHomePath];
         }
 
-        const homeKey = `${source}\0${yield* directoryIdentity(homePath)}`;
-        if (seenHomes.has(homeKey)) continue;
-        seenHomes.add(homeKey);
-        homes.push({ homePath, providerInstanceId: instanceId });
+        for (const homePath of homePaths) {
+          const homeKey = `${source}\0${yield* directoryIdentity(homePath)}`;
+          if (seenHomes.has(homeKey)) continue;
+          seenHomes.add(homeKey);
+          homes.push({ homePath, providerInstanceId: instanceId });
+        }
       }
 
       const transcriptCandidates: Array<TranscriptCandidate> = [];
@@ -1810,7 +1968,9 @@ export const make = Effect.gen(function* () {
           ? discoverClaudeTranscripts
           : source === "codex"
             ? discoverCodexTranscripts
-            : discoverPiTranscripts;
+            : source === "pi"
+              ? discoverPiTranscripts
+              : discoverAntigravityTranscripts;
       const shares = splitOperationBudget(MAX_DISCOVERY_OPERATIONS_PER_SOURCE, homes.length);
       const discovered: Array<{
         readonly transcripts: ReadonlyArray<TranscriptCandidate>;
@@ -2160,7 +2320,15 @@ export const make = Effect.gen(function* () {
           }
           transcriptsRemaining -= 1;
           bytesRemaining -= identity.size;
-          const snapshot = yield* readTranscript(transcript.filePath, identity, candidate.source);
+          const snapshot =
+            candidate.source === "antigravity"
+              ? yield* readAntigravityThread(identity, {
+                  source: candidate.source,
+                  providerInstanceId: candidate.providerInstanceId,
+                  fallbackSessionId: path.basename(transcript.filePath, ".db"),
+                  lastActiveAtMs: transcript.mtimeMs,
+                })
+              : yield* readTranscript(transcript.filePath, identity, candidate.source);
           if (snapshot === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
@@ -2178,31 +2346,34 @@ export const make = Effect.gen(function* () {
           const worktree = yield* rootWorktree(path.resolve(expandedCwd));
 
           const inheritedRecords =
-            candidate.source === "codex"
+            candidate.source === "codex" && "records" in snapshot
               ? yield* readCodexHistoryBase(
                   candidate.providerInstanceId,
                   snapshot.records,
                   snapshot.historyBytes,
                 )
               : null;
-          const parsedThread = parseAgentSessionRecords(
-            {
-              source: candidate.source,
-              providerInstanceId: candidate.providerInstanceId,
-              fallbackSessionId: path.basename(
-                transcript.filePath,
-                isCompressedTranscript(transcript.filePath)
-                  ? COMPRESSED_TRANSCRIPT_SUFFIX
-                  : ".jsonl",
-              ),
-              lastActiveAtMs: transcript.mtimeMs,
-            },
-            inheritedRecords === null
-              ? snapshot.records
-              : [...inheritedRecords, ...snapshot.records],
-            snapshot.claudeFields,
-            snapshot.droppedMessageCount,
-          );
+          const parsedThread =
+            "thread" in snapshot
+              ? snapshot.thread
+              : parseAgentSessionRecords(
+                  {
+                    source: candidate.source,
+                    providerInstanceId: candidate.providerInstanceId,
+                    fallbackSessionId: path.basename(
+                      transcript.filePath,
+                      isCompressedTranscript(transcript.filePath)
+                        ? COMPRESSED_TRANSCRIPT_SUFFIX
+                        : ".jsonl",
+                    ),
+                    lastActiveAtMs: transcript.mtimeMs,
+                  },
+                  inheritedRecords === null
+                    ? snapshot.records
+                    : [...inheritedRecords, ...snapshot.records],
+                  snapshot.claudeFields,
+                  snapshot.droppedMessageCount,
+                );
           if (parsedThread === "empty") {
             // null means an unreadable history base, which may hold the conversation.
             if (candidate.source === "codex" && inheritedRecords === null) {

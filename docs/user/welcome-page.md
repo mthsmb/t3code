@@ -2,8 +2,8 @@
 
 T3 Code shows a Welcome page when you open a new installation. Existing
 workspaces skip it. It shows what T3 Code found on the computer you are using,
-on one page: your agents, projects from your Claude Code, Codex, and Pi history,
-and the phone app. Only an agent is needed to start chatting.
+on one page: your agents, projects from your Claude Code, Codex, Pi, and
+Antigravity history, and the phone app. Only an agent is needed to start chatting.
 
 To see the page again, go to **Settings → About → Welcome page** and select
 **Open**. Direct links, such as Settings, open normally before setup is done.
@@ -64,7 +64,7 @@ app with a code from **Settings → Sharing & access**.
 
 ## Projects
 
-T3 Code finds directories that Claude Code, Codex or Pi has used. Git repositories
+T3 Code finds directories that Claude Code, Codex, Pi or Antigravity has used. Git repositories
 are listed first, newest activity on top. When the remote is on GitHub, the
 group shows the repository as `owner/name`. Clones with the same remote share
 one group. Directories that are not git repositories sit under "Other folders".
@@ -82,13 +82,26 @@ anything under `Downloads` are not offered.
 A large or malformed history can reach the scan limit. T3 Code keeps the
 projects it found and warns when projects or conversations may be missing.
 
-Imported projects include Claude, Codex and Pi conversations active within the last
+Imported projects include Claude, Codex, Pi and Antigravity conversations active within the last
 30 days. You can continue those conversations in T3 Code. Pi is off by default:
 open **Add more agents** and select **Turn on** next to Pi, and the page looks for
 its sessions too. Pi sessions
 are read from each enabled Pi provider's session directory, which follows
 `PI_CODING_AGENT_SESSION_DIR` and `PI_CODING_AGENT_DIR` in its environment. A
 Pi conversation imports its active branch, the one Pi reopens.
+
+Antigravity is off by default too: open **Add more agents** and select **Turn on**
+next to Antigravity, and the page looks for its conversations. T3 Code reads
+conversations from the Antigravity CLI, the Antigravity app and IDE, and other ACP
+clients. It does not read conversations Antigravity stored in its older encrypted
+format, or conversations that ran without a workspace folder. To read other
+directories, set `ANTIGRAVITY_DATA_DIR` on the server or in the Antigravity
+provider's environment, separating several with commas. A configured value
+replaces the default folders (`antigravity-cli`, `antigravity`, `antigravity-ide`,
+and `antigravity-acp` in `~/.gemini`), so list any of those you still want read.
+Your first message in an imported Antigravity conversation starts a new
+Antigravity session that receives the imported history as context. The original
+conversation is not resumed or changed.
 
 Conversation import is best effort. T3 Code keeps the first user prompt and the
 newest remaining visible user and assistant messages, with 200 messages total.
@@ -98,10 +111,12 @@ same user turn. Ambiguous legacy or response-only context stays in the imported
 conversation so T3 Code does not remove user text. It reads one conversation at
 a time and skips files larger than 4 GiB. It also skips a conversation when the
 message text and metadata it keeps need more than 32 MiB of memory. Tool output
-does not count toward that limit. It skips a conversation with more than 100,000
-records every time, so opening the page again does not import it. It ignores
-malformed records and conversations with no messages, such as a session opened
-in an editor but never used. It skips unreadable or unparseable conversations.
+does not count toward that limit. It skips a Codex or Pi conversation with more
+than 100,000 records every time, so opening the page again does not import it.
+A longer Claude or Antigravity conversation still imports its first prompt and
+newest messages. T3 Code ignores malformed records and conversations with no
+messages, such as a session opened in an editor but never used. It skips
+unreadable or unparseable conversations.
 
 Each import attempt reads up to 100 conversations and 4 GiB per project.
 Conversations with no messages count toward the 4 GiB but not the 100. To

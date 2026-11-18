@@ -101,6 +101,10 @@ function candidate(
 }
 
 const PI_MODEL_SELECTION = { instanceId: ProviderInstanceId.make("pi"), model: "default" };
+const ANTIGRAVITY_MODEL_SELECTION = {
+  instanceId: ProviderInstanceId.make("antigravity"),
+  model: "default",
+};
 
 // Pi threads are owned by their session file path, not the session UUID.
 const nativeId = ({ source }: ReturnType<typeof candidate>) =>
@@ -299,11 +303,17 @@ it.effect(
       );
       const deleted = candidate(CODEX_MODEL_SELECTION, "deleted");
       const ownedPi = candidate(PI_MODEL_SELECTION, "owned-pi", "pi");
+      const ownedAntigravity = candidate(
+        ANTIGRAVITY_MODEL_SELECTION,
+        "3c9d2b1e-4f5a-4b6c-8d7e-9f0a1b2c3d4e",
+        "antigravity",
+      );
       const owners = [
         yield* seedOwner(active),
         yield* seedOwner(archived, "archived"),
         yield* seedOwner(deleted, "deleted"),
         yield* seedOwner(ownedPi),
+        yield* seedOwner(ownedAntigravity),
       ];
       const before = yield* Effect.forEach(owners, (id) =>
         projections.getThreadRecords(id, ["providerThreads"]),
@@ -317,18 +327,25 @@ it.effect(
       unowned.thread.omittedMessageCount = 1;
       unowned.worktree = { path: "/workspace/project/.claude/worktrees/feat", branch: "feat" };
       const unownedPi = candidate(PI_MODEL_SELECTION, "unowned-pi", "pi");
+      const antigravity = candidate(
+        ANTIGRAVITY_MODEL_SELECTION,
+        "7d0f6a52-93a0-4b0e-9d3b-6a5b8c1e2f10",
+        "antigravity",
+      );
       const importer = yield* makeImporter([
         active,
         archived,
         deleted,
         ownedPi,
+        ownedAntigravity,
         otherInstance,
         unowned,
         unownedPi,
+        antigravity,
       ]);
 
-      expect(yield* importer.run).toEqual({ importedCount: 3, skippedCount: 0 });
-      for (const source of [active, archived, deleted, ownedPi]) {
+      expect(yield* importer.run).toEqual({ importedCount: 4, skippedCount: 0 });
+      for (const source of [active, archived, deleted, ownedPi, ownedAntigravity]) {
         const threadId = importId(source);
         expect(yield* Effect.option(projections.getThread(threadId))).toEqual(Option.none());
         expect(yield* events.read({ threadId }).pipe(Stream.runCollect)).toEqual([]);
@@ -345,8 +362,15 @@ it.effect(
             "event" in stored ? [stored.event.threadId] : [],
           ),
         ),
-      ).toEqual(new Set([importId(otherInstance), importId(unowned), importId(unownedPi)]));
-      for (const source of [otherInstance, unowned, unownedPi]) {
+      ).toEqual(
+        new Set([
+          importId(otherInstance),
+          importId(unowned),
+          importId(unownedPi),
+          importId(antigravity),
+        ]),
+      );
+      for (const source of [otherInstance, unowned, unownedPi, antigravity]) {
         const threadId = importId(source);
         const records = yield* projections.getThreadRecords(threadId, [
           "messages",
@@ -370,14 +394,26 @@ it.effect(
         expect(records.thread.historyOrigin).toBe("v1_import");
         expect(records.thread.worktreePath).toBe(source.worktree?.path ?? null);
         expect(records.thread.branch).toBe(source.worktree?.branch ?? null);
-        expect(records.thread.activeProviderThreadId).toBe(records.providerThreads[0]?.id);
-        expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe(nativeId(source));
+        if (source === antigravity) {
+          expect(records.thread.activeProviderThreadId).toBeNull();
+          expect(records.providerThreads).toEqual([]);
+          expect(
+            yield* events
+              .read({ threadId, eventType: "provider-thread.updated" })
+              .pipe(Stream.runCollect),
+          ).toEqual([]);
+        } else {
+          expect(records.thread.activeProviderThreadId).toBe(records.providerThreads[0]?.id);
+          expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe(nativeId(source));
+        }
         expect(Option.getOrThrow(yield* runtimes.getByThreadId({ threadId }))).toMatchObject({
           providerInstanceId: source.source.providerInstanceId,
           resumeCursor:
-            source.source.provider === "claudeAgent"
-              ? { threadId, resume: source.source.providerSessionId }
-              : { threadId: nativeId(source) },
+            source === antigravity
+              ? null
+              : source.source.provider === "claudeAgent"
+                ? { threadId, resume: source.source.providerSessionId }
+                : { threadId: nativeId(source) },
           runtimePayload: {
             cwd: source.worktree?.path ?? "/workspace/project",
             importedTranscripts: [source.source],

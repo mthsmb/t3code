@@ -65,3 +65,10 @@ export const timestamp = (value: Fields) => {
   const seconds = numberAt(value, 1);
   return seconds > 0 ? seconds * 1000 + Math.floor(numberAt(value, 2) / 1_000_000) : null;
 };
+
+/** Unlike textAt, never throws on invalid UTF-8; for text shown to users rather than identifiers. */
+export const lenientText = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
+export const lenientTextAt = (value: Fields, key: number) => {
+  const bytes = bytesAt(value, key);
+  return bytes === undefined ? "" : lenientText(bytes).trim();
+};

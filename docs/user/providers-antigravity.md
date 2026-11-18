@@ -98,6 +98,15 @@ without the turns you removed.
 Manual context compaction is unavailable through Antigravity's ACP runtime, even
 though its CLI has `/compact`. Send `/clear` when you need a fresh context.
 
+### Import conversations
+
+The [Welcome page](./welcome-page.md#projects) can import conversations you had in
+the Antigravity CLI, the Antigravity app and IDE, and other ACP clients. Turn on
+Antigravity first. Your first message in an imported thread starts a new
+Antigravity session that receives the imported history as context. T3 Code runs
+Antigravity with its own profile, even when it uses an `agy` executable from your
+`PATH`, so your CLI history is imported, not shared.
+
 ### Skills and attachments
 
 Put project skills in `.agents/skills`. T3 Code also reads `.gemini/skills` and the
