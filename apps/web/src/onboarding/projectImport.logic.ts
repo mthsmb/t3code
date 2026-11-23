@@ -249,8 +249,8 @@ export async function importProjectInBatches(input: {
     previous = current;
     const settled = {
       imported,
-      failed: current.skippedCount - (progressed ? deferred : 0),
-      deferred: progressed ? deferred : 0,
+      failed: current.skippedCount - deferred,
+      deferred,
       requestFailed: false,
     };
     const hasMore =

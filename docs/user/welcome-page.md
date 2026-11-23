@@ -122,10 +122,9 @@ conversations per run limit) and 4 GiB. Conversations with no messages count
 toward the 4 GiB but not the 100. The page starts the next batch while each
 batch makes progress, and a line under the import box shows the project, how
 many threads were imported and how many are left. If a batch makes no progress,
-the page stops importing that project and counts the rest as conversations
-that could not be imported. Completed conversations are not imported again. A
-computer running an older T3 Code version imports one batch each time you select
-**Start**.
+the page stops importing that project, and the rest stays not imported yet.
+Completed conversations are not imported again. A computer running an older T3
+Code version imports one batch each time you select **Start**.
 
 Select **Stop importing** to finish after the current batch, without starting
 the next project. The summary counts conversations that could not be imported

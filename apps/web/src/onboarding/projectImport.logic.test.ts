@@ -305,9 +305,9 @@ describe("importProjectInBatches", () => {
       ],
     },
     {
-      name: "stops after a batch without progress and counts what is left as failed",
+      name: "stops after a batch without progress and keeps what is left as not imported yet",
       batches: [batch(2, 6, 5), batch(0, 6, 5), batch(5, 0, 0)],
-      result: { imported: 2, failed: 6, deferred: 0, requestFailed: false, stopped: false },
+      result: { imported: 2, failed: 1, deferred: 5, requestFailed: false, stopped: false },
       progress: [
         { imported: 2, left: 5 },
         { imported: 2, left: 5 },
